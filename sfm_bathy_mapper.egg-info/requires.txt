@@ -1,0 +1,11 @@
+pandas>=2.0
+polars>=1.0
+rasterio>=1.4.3
+geopandas
+ipykernel
+laspy
+xarray
+rioxarray
+numpy
+scipy
+matplotlib

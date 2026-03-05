@@ -1,0 +1,10 @@
+LICENSE
+README.md
+main.py
+pyproject.toml
+sfm_bathy_mapper.egg-info/PKG-INFO
+sfm_bathy_mapper.egg-info/SOURCES.txt
+sfm_bathy_mapper.egg-info/dependency_links.txt
+sfm_bathy_mapper.egg-info/requires.txt
+sfm_bathy_mapper.egg-info/top_level.txt
+sfmbathy/prep.py
