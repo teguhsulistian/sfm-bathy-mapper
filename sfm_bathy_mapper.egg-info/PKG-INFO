@@ -1,0 +1,32 @@
+Metadata-Version: 2.4
+Name: sfm-bathy-mapper
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: pandas>=2.0
+Requires-Dist: polars>=1.0
+Requires-Dist: rasterio>=1.4.3
+Requires-Dist: geopandas
+Requires-Dist: ipykernel
+Requires-Dist: laspy
+Requires-Dist: xarray
+Requires-Dist: rioxarray
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: matplotlib
+Dynamic: license-file
+
+# sfm-bathy-mapper
+Tool for extracting bathymetry data from structure from motion (sfm) photogrammetry. 
+
+## 1. Install UV
+Firstly, install UV for create python environment, then check uv version and python version
+```bash
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+uv --version
+python --version
+```
+
+## 2. Clone Repository
