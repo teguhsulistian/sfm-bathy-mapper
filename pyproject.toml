@@ -18,7 +18,7 @@ dependencies = [
     "numpy",
     "scipy",
     "matplotlib",
-    "pyTMD @ git+https://github.com/teguhsulistian/pyTMD.git@inatides-model",
+    "pyTMD @ git+https://github.com/teguhsulistian/pyTMD.git@inatides-v2",
 ]
 
 [tool.setuptools.packages.find]

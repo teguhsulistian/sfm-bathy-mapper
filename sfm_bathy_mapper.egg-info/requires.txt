@@ -1,0 +1,13 @@
+pandas>=2.0
+polars>=1.0
+rasterio>=1.4.3
+eo-tides
+geopandas
+ipykernel
+laspy
+xarray
+rioxarray
+numpy
+scipy
+matplotlib
+pyTMD @ git+https://github.com/teguhsulistian/pyTMD.git@inatides-v2
