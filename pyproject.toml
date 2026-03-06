@@ -15,6 +15,7 @@ dependencies = [
     "laspy",
     "xarray",
     "rioxarray",
+    "pyproj",
     "numpy",
     "scipy",
     "matplotlib",
