@@ -11,7 +11,9 @@ from rasterio.transform import rowcol
 def load_las(file_path):
     #input las file, return point cloud as numpy array and las object
     las = laspy.read(file_path)
-    pc = np.vstack([las.x, las.y, las.z]).T.astype("float32")
+    xyz = np.asarray([las.x, las.y, las.z], dtype=np.float32).T
+    rgb = np.asarray([las.red, las.green, las.blue], dtype=np.uint8).T
+    pc = np.hstack((xyz, rgb))
     
     #Find median of x and y for tide calculation
     x_med = np.median(pc[:,0])
@@ -53,7 +55,7 @@ def tide_calc(tide_dir, model, x, y, start_time, end_time, freq):
     WL = msl_ellips + tide_mean
 
     print(f"Location Lon: {x:.6f}, Lat: {y:.6f} | time range: {start_time} to {end_time}")
-    print(f"Mean Tide Height: {tide_mean:.3f} m , refer to MSL")    
+    print(f"Representative Water Level: {tide_mean:.3f} m , refer to MSL")    
     print(f"Representative Water Level: {WL:.3f} m , refer to Ellipsoid Reference")
 
     return WL
