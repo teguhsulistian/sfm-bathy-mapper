@@ -9,6 +9,14 @@ from rasterio.transform import rowcol
 ## (1) Load LAS file and extract point cloud data, median coordinates, and CRS information ##
 
 def load_las(file_path):
+    """
+    Load the LAS file and extract point cloud data, median coordinates, and CRS information.
+    Parameters:
+    file_path (str): The file path to the input LAS file.
+    
+    Returns:
+    tuple: A tuple containing the point cloud as a numpy array, the LAS object, and the median longitude and latitude.  
+    """
     #input las file, return point cloud as numpy array and las object
     las = laspy.read(file_path)
     xyz = np.asarray([las.x, las.y, las.z], dtype=np.float32).T
@@ -30,6 +38,22 @@ def load_las(file_path):
 
 ## (2) Tide calculation to define water level##
 def tide_calc(tide_dir, model, x, y, start_time, end_time, freq):
+    """
+    Calculate the representative water level (WL) for the location and time range of the point cloud data.
+    This function uses the eo-tides library to model tides and rasterio to read the MSL to Ellipsoid height from a GeoTIFF file.    
+    Parameters:
+    tide_dir (str): Directory path where the tide model data and DATUM GeoTIFF are stored.
+    model (str): The name of the tide model to use (e.g., "GOT", "FES", "TPXO").
+    x (float): Longitude of the location.     
+    y (float): Latitude of the location.
+    start_time (str): Start time for tide calculation in ISO format UTC Time (e.g., "2024-01-01T00:00:00Z").
+    end_time (str): End time for tide calculation in ISO format UTC Time (e.g., "2024-01-01T00:00:00Z").
+    freq (str): Frequency of the time range for tide calculation (e.g., "1H" for hourly).
+    
+    eturns:
+    float: The representative water level (WL) in meters relative to the ellipsoid reference.
+
+    """
     #Calculate tides using the specified model and parameters, return tide results as a DataFrame
     tide_results = model_tides(
         x=x,
