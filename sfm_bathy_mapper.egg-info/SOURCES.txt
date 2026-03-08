@@ -1,6 +1,5 @@
 LICENSE
 README.md
-main.py
 pyproject.toml
 sfm_bathy_mapper.egg-info/PKG-INFO
 sfm_bathy_mapper.egg-info/SOURCES.txt
