@@ -193,5 +193,106 @@ def ifov_calculation(eo, sensor, mean_elev, chunk_size=1000, n_jobs=1, verbose=T
 
     return result
 
+def _contains_single(args):
+    """
+    Cek apakah pc_xy berada di dalam satu Path object.
+    Diperlukan sebagai fungsi top-level agar bisa di-pickle oleh multiprocessing.
+
+    Parameters
+    ----------
+    args : tuple (path, pc_xy)
+        path  : matplotlib.path.Path
+        pc_xy : ndarray (N_pt, 2)
+
+    Returns
+    -------
+    ndarray (N_pt,) bool
+    """
+    path, pc_xy = args
+    return path.contains_points(pc_xy)
 
 
+def visible_points(eo, ifov, pc, n_jobs=1, verbose=False):
+    """
+    Cek visibilitas titik point cloud (pc) terhadap setiap kamera (eo),
+    dan hitung sudut inklinasi r (untuk koreksi refraksi).
+
+    Parameters
+    ----------
+    eo     : pd.DataFrame (N_cam × ≥6)  — kolom: x, y, z, ... (exterior orientation)
+    ifov   : pd.DataFrame (N_cam × 1)   — kolom: fov (matplotlib Path, instantaneous FOV)
+    pc     : pd.DataFrame (N_pt × ≥3)   — kolom: x, y, sfm_z (point cloud)
+    n_jobs : int  — jumlah proses paralel (default 1; -1 = semua CPU)
+    verbose: bool — tampilkan progress
+
+    Returns
+    -------
+    r_filt : ndarray (N_pt, N_cam) float64
+        Sudut inklinasi dalam derajat. NaN jika titik tidak terlihat
+        oleh kamera tersebut, atau jika ifov mengandung NaN.
+    """
+    n_cam = eo.shape[0]
+    n_pt  = pc.shape[0]
+
+    # ── 1. Siapkan array koordinat pc sekali saja ──────────────────
+    # Shape (N_pt, 2) — dipakai berulang untuk semua kamera
+    pc_xy = np.column_stack([
+        pc['x'].to_numpy(dtype=np.float64),
+        pc['y'].to_numpy(dtype=np.float64),
+    ])
+
+    # ── 2. Hitung vis: cek contains_points untuk semua kamera ──────
+    # Opsi A (serial) — satu stack tanpa overhead Pool
+    # Opsi B (parallel) — distribusi ke banyak proses
+
+    paths = ifov['fov'].tolist()   # list N_cam Path objects
+
+    if n_jobs == 1:
+        # Serial: lebih cepat dari original karena tidak ada overhead
+        # per-iterasi yang berulang; stack hasilnya sekali di akhir
+        vis_cols = [p.contains_points(pc_xy) for p in paths]
+
+    else:
+        # Parallel: tiap proses menangani satu kamera (satu Path)
+        workers = cpu_count() if n_jobs == -1 else n_jobs
+        args = [(p, pc_xy) for p in paths]
+        with Pool(workers) as pool:
+            vis_cols = pool.map(_contains_single, args)
+
+    # Stack list of (N_pt,) → array (N_pt, N_cam), dtype bool
+    vis = np.column_stack(vis_cols)   # shape (N_pt, N_cam)
+
+    if verbose:
+        n_visible = int(vis.sum())
+        print(f"Visible points: {n_visible:,} pasangan pc-kamera terlihat "
+              f"dari {n_pt * n_cam:,} total.")
+
+    # ── 3. Hitung delta koordinat (broadcasting) ───────────────────
+    # eo_x  : shape (1, N_cam)
+    # pc_x  : shape (N_pt, 1)
+    # hasil : shape (N_pt, N_cam)  — broadcasting otomatis
+    eo_x = eo['x'].to_numpy(dtype=np.float64)[np.newaxis, :]   # (1, N_cam)
+    eo_y = eo['y'].to_numpy(dtype=np.float64)[np.newaxis, :]
+    eo_z = eo['z'].to_numpy(dtype=np.float64)[np.newaxis, :]
+
+    pc_x = pc['x'].to_numpy(dtype=np.float64)[:, np.newaxis]   # (N_pt, 1)
+    pc_y = pc['y'].to_numpy(dtype=np.float64)[:, np.newaxis]
+    pc_z = pc['sfm_z'].to_numpy(dtype=np.float64)[:, np.newaxis]
+
+    dx = eo_x - pc_x   # (N_pt, N_cam)
+    dy = eo_y - pc_y
+    dz = eo_z - pc_z
+
+    # ── 4. Hitung jarak horizontal d dan sudut inklinasi r ─────────
+    # np.hypot lebih stabil secara numerik dibanding sqrt(dx²+dy²)
+    # d = Euclidean distance to the SfM point from the camera
+    # r = angle of refraction (from nadir to the SfM point)
+    d = np.hypot(dx, dy)                      # (N_pt, N_cam)
+    r = np.rad2deg(np.arctan2(d, dz))         # arctan2 aman saat dz=0
+
+    # ── 5. Masking: sembunyikan r yang tidak visible → NaN ─────────
+    # Gunakan np.where dengan vis bool — TIDAK memakai r*vis==0
+    # sehingga titik dengan r=0 yang benar-benar visible tidak ikut hilang
+    r_filter = np.where(vis, r, np.nan)         # (N_pt, N_cam)
+
+    return r_filter
