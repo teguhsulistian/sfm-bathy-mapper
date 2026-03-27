@@ -1,4 +1,5 @@
 import sys
+import laspy
 import numpy as np
 import pandas as pd
 import matplotlib.path as mplPath
@@ -97,19 +98,19 @@ def ifov_calculation(eo, sensor, mean_elev, chunk_size=1000, n_jobs=1, verbose=T
     """
     N = eo.shape[0]
 
-    # ── Convert sensor dimensions to meters ──
+    # Convert sensor dimensions to meters
     f  = sensor.focal[0]    * 1e-3
     sx = sensor.sensor_x[0] * 5e-4   # /2 * 0.001
     sy = sensor.sensor_y[0] * 5e-4
 
-    # ── Critical pitch ──
+    # Critical pitch
     crit_pitch = 90.0 - np.rad2deg(np.arctan(sy / f))
 
     if verbose:
         print(f"Processing {N:,} cameras (chunk={chunk_size}, jobs={n_jobs})...")
         sys.stdout.flush()
 
-    # ── Extract NumPy arrays from DataFrame ──
+    # Extract NumPy arrays from DataFrame
     xs     = eo['x'].to_numpy(dtype=np.float64)
     ys     = eo['y'].to_numpy(dtype=np.float64)
     zs     = eo['z'].to_numpy(dtype=np.float64)
@@ -120,7 +121,7 @@ def ifov_calculation(eo, sensor, mean_elev, chunk_size=1000, n_jobs=1, verbose=T
     # Pitch for rotation: 90 - pitch_raw (in radians) for correct orientation
     pitches = np.deg2rad(90.0 - pitches_raw)
 
-    # ── Mark cameras that exceed the critical pitch ──
+    # Mark cameras that exceed the critical pitch
     valid_mask = pitches_raw < crit_pitch   # (N,) bool
 
     # Template sensor corners relative to the camera center before rotation
@@ -133,11 +134,11 @@ def ifov_calculation(eo, sensor, mean_elev, chunk_size=1000, n_jobs=1, verbose=T
         [-sx, -f,  sy],
     ], dtype=np.float64)  # (4, 3)
 
-    # ── Prepare output ──
-    # all_corners_world: (N, 4, 2) — Ground plane coordinates (X,Y) of the footprint.
+    # Prepare output
+    # all_corners_world: (N, 4, 2) , Ground plane coordinates (X,Y) of the footprint.
     all_inter = np.full((N, 4, 2), np.nan)
 
-    # ── Process inside chunk  ──
+    # Process inside chunk
     n_jobs = cpu_count() if n_jobs == -1 else n_jobs
 
     indices = np.where(valid_mask)[0]   # Only process valid cameras
@@ -162,7 +163,7 @@ def ifov_calculation(eo, sensor, mean_elev, chunk_size=1000, n_jobs=1, verbose=T
         # Add camera position → world coordinates of sensor corners
         corners_world = rotated + cam_pts[:, np.newaxis, :]   # (n_chunk, 4, 3)
 
-              # ── Ray–Plane intersection for all (camera × corner) simultaneously ──
+        # Ray–Plane intersection for all (camera × corner) simultaneously
         # Ray: from corners_world through cam_pts, direction = cam_pts - corners_world
         # Flatten to (n_chunk*4, 3)
             
@@ -183,7 +184,7 @@ def ifov_calculation(eo, sensor, mean_elev, chunk_size=1000, n_jobs=1, verbose=T
             print(f"  {start + n_chunk:,} / {len(indices):,} kamera valid diproses...")
             sys.stdout.flush()
 
-    # ── Output DataFrame ──
+    # Output DataFrame
     fov_list = [mplPath.Path(all_inter[i]) for i in range(N)]
     result = pd.DataFrame({'fov': fov_list})
 
@@ -296,3 +297,105 @@ def visible_points(eo, ifov, pc, n_jobs=1, verbose=False):
     r_filter = np.where(vis, r, np.nan)         # (N_pt, N_cam)
 
     return r_filter
+
+def process_refraction(r, pc, wl, n_water):
+    """
+    Process correcting for point cloud depth based on multi-view stereo photogrammetry
+    
+    parameters:
+    r       : ndarray (N_pt, N_cam) float64 — angle of refraction in degrees. NaN if the point is not visible from the camera, or if the ifov contains NaN.
+    pc      : (numpy.ndarray) The input point cloud as a Nx6 array (x, y, z, red, green, blue).
+    wl      : float — water level (tide height) at the time of data capture in meters
+    n_water : float or "default" — refractive index of water (default 1.33 for visible light in water)  
+
+    returns:
+    pc_corrected : pd.DataFrame (N_pt × ≥3) — columns: x, y, z (corrected point cloud)
+
+    """
+    # 1. Defining the refractive index of water, default is 1.33 for visible light in water
+    if n_water == "default":
+        n_water = 1.33
+    else:
+        n_water = float(n_water)
+
+    # 2. Convert r array to radians
+    rad_r = np.deg2rad(r)
+
+    # 3. Calculate angle of incidence
+    rad_i = np.arcsin(1.0/n_water * np.sin(rad_r))
+
+    # 4. Calculate distance from the SfM point to the air/water interface point  
+    xd = (pc_filtered[:,2]-wl) * np.tan(rad_r)
+
+    # 5. Seperate point cloud into below and above water level
+    pc_filtered = pc[pc[:,2] < wl]
+    pc_land = pc[pc[:,2] >= wl]
+
+    # 5. Calculate the corrected (actual) depth
+    pc_filtered[:,2] = wl - xd/np.tan(rad_i)
+
+
+    pc_corrected = np.vstack((pc_filtered, pc_land))
+
+    print(f"Number of points below water level: {len(pc_filtered)}, percentage: {len(pc_filtered)/len(pc)*100:.2f}%")
+    print(f"Number of points above water level: {len(pc_land)}, percentage: {len(pc_land)/len(pc)*100:.2f}%")   
+    print(f"Original point cloud size: {len(pc)}, Corrected point cloud size: {len(pc_corrected)}")
+    
+    return pc_corrected
+
+def process_small_angle(pc, WL, n_water):
+    """
+    Process the point cloud to correct for refraction based on the water level and refractive index.
+
+    Parameters:
+    pc (numpy.ndarray): The input point cloud as a Nx6 array (x, y, z, red, green, blue).
+    WL (float): The water level (tide height) at the time of data capture.
+    n_water (float): The refractive index of water.
+
+    Returns:
+    numpy.ndarray: The corrected point cloud.
+    """
+    # Defining the refractive index of water, default is 1.33 for visible light in water
+    if n_water == "default":
+        n_water = 1.33
+    else:
+        n_water = float(n_water)
+
+    # Processing the point cloud to correct for refraction (small angel approach)
+    pc_filtered = pc[pc[:,2] < WL]
+    pc_filtered[:,2] = ((pc_filtered[:,2]-WL) * n_water) + WL
+
+    pc_land = pc[pc[:,2] >= WL]
+
+    pc_corrected = np.vstack((pc_filtered, pc_land))
+
+    print(f"Number of points below water level: {len(pc_filtered)}, percentage: {len(pc_filtered)/len(pc)*100:.2f}%")
+    print(f"Number of points above water level: {len(pc_land)}, percentage: {len(pc_land)/len(pc)*100:.2f}%")   
+    print(f"Original point cloud size: {len(pc)}, Corrected point cloud size: {len(pc_corrected)}")
+    
+    return pc_corrected
+
+
+def export_pc(pc_corrected, las, output_path):
+    """
+    Save the corrected point cloud to a new LAS file.
+
+    Parameters:
+    pc_corrected (numpy.ndarray): The corrected point cloud as a Nx6 array (x, y, z, red, green, blue).
+    las (laspy.LasData): The original LAS data object to copy header information from.
+    output_path (str): The file path to save the corrected LAS file.
+    """
+    # Create a new LAS object with the same header as the original
+    las_corrected = laspy.LasData(las.header)
+
+    # Update the point data with the corrected point cloud
+    las_corrected.x = pc_corrected[:, 0]
+    las_corrected.y = pc_corrected[:, 1]
+    las_corrected.z = pc_corrected[:, 2]
+    las_corrected.red = pc_corrected[:, 3].astype(np.uint16)
+    las_corrected.green = pc_corrected[:, 4].astype(np.uint16)
+    las_corrected.blue = pc_corrected[:, 5].astype(np.uint16)
+
+    # Save the corrected LAS file
+    las_corrected.write(output_path)
+    print(f"Corrected LAS file saved to: {output_path}")
