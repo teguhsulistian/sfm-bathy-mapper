@@ -217,43 +217,45 @@ def visible_points(eo, ifov, pc, n_jobs=1, verbose=False):
     Cek visibilitas titik point cloud (pc) terhadap setiap kamera (eo),
     dan hitung sudut inklinasi r (untuk koreksi refraksi).
 
+    Point cloud (pc) which is visible from a camera is determined by whether its (x,y) coordinates
+    and calculated inclination angle r fall within the camera's instantaneous field of view (ifov) polygon.
+
     Parameters
     ----------
-    eo     : pd.DataFrame (N_cam × ≥6)  — kolom: x, y, z, ... (exterior orientation)
-    ifov   : pd.DataFrame (N_cam × 1)   — kolom: fov (matplotlib Path, instantaneous FOV)
-    pc     : pd.DataFrame (N_pt × ≥3)   — kolom: x, y, sfm_z (point cloud)
-    n_jobs : int  — jumlah proses paralel (default 1; -1 = semua CPU)
-    verbose: bool — tampilkan progress
+    eo     : pd.DataFrame (N_cam × ≥6)  — columns: x, y, z, ... (exterior orientation)
+    ifov   : pd.DataFrame (N_cam × 1)   — columns: fov (matplotlib Path, instantaneous FOV)
+    pc     : pd.DataFrame (N_pt × ≥3)   — columns: x, y, z (point cloud)
+    n_jobs : int  — number of parallel processes (default 1; -1 = all CPU)
+    verbose: bool — display progress and summary
 
     Returns
     -------
-    r_filt : ndarray (N_pt, N_cam) float64
-        Sudut inklinasi dalam derajat. NaN jika titik tidak terlihat
-        oleh kamera tersebut, atau jika ifov mengandung NaN.
+    r_filter : ndarray (N_pt, N_cam) float64
+        inclination angle in degrees. NaN if the point is not visible
+        from the camera, or if the ifov contains NaN.
     """
     n_cam = eo.shape[0]
     n_pt  = pc.shape[0]
 
-    # ── 1. Siapkan array koordinat pc sekali saja ──────────────────
-    # Shape (N_pt, 2) — dipakai berulang untuk semua kamera
+    # 1. Prepare pc coordinates once for all cameras
+    # Shape (N_pt, 2) — used repeatedly for all cameras
     pc_xy = np.column_stack([
         pc['x'].to_numpy(dtype=np.float64),
         pc['y'].to_numpy(dtype=np.float64),
     ])
 
-    # ── 2. Hitung vis: cek contains_points untuk semua kamera ──────
-    # Opsi A (serial) — satu stack tanpa overhead Pool
-    # Opsi B (parallel) — distribusi ke banyak proses
+    # 2. Visibility calculating for each constains_points
+    # Opsi A (serial) — A stack without overhead Pool
+    # Opsi B (parallel) — Distributed in many process
 
     paths = ifov['fov'].tolist()   # list N_cam Path objects
 
     if n_jobs == 1:
-        # Serial: lebih cepat dari original karena tidak ada overhead
-        # per-iterasi yang berulang; stack hasilnya sekali di akhir
+        # Serial: Faster than original due to no multiprocessing overhead, especially for small N_cam
         vis_cols = [p.contains_points(pc_xy) for p in paths]
 
     else:
-        # Parallel: tiap proses menangani satu kamera (satu Path)
+        # Parallel: each process handing one camera's Path.contains_points → faster for large N_cam, but beware of overhead and RAM usage
         workers = cpu_count() if n_jobs == -1 else n_jobs
         args = [(p, pc_xy) for p in paths]
         with Pool(workers) as pool:
@@ -267,32 +269,30 @@ def visible_points(eo, ifov, pc, n_jobs=1, verbose=False):
         print(f"Visible points: {n_visible:,} pasangan pc-kamera terlihat "
               f"dari {n_pt * n_cam:,} total.")
 
-    # ── 3. Hitung delta koordinat (broadcasting) ───────────────────
+    # 3. Calculate delta x, y, z from camera to point cloud for all pairs (N_pt, N_cam)
     # eo_x  : shape (1, N_cam)
     # pc_x  : shape (N_pt, 1)
-    # hasil : shape (N_pt, N_cam)  — broadcasting otomatis
+    # result : shape (N_pt, N_cam)  — automatic broadcasting
     eo_x = eo['x'].to_numpy(dtype=np.float64)[np.newaxis, :]   # (1, N_cam)
     eo_y = eo['y'].to_numpy(dtype=np.float64)[np.newaxis, :]
     eo_z = eo['z'].to_numpy(dtype=np.float64)[np.newaxis, :]
 
     pc_x = pc['x'].to_numpy(dtype=np.float64)[:, np.newaxis]   # (N_pt, 1)
     pc_y = pc['y'].to_numpy(dtype=np.float64)[:, np.newaxis]
-    pc_z = pc['sfm_z'].to_numpy(dtype=np.float64)[:, np.newaxis]
+    pc_z = pc['z'].to_numpy(dtype=np.float64)[:, np.newaxis]
 
     dx = eo_x - pc_x   # (N_pt, N_cam)
     dy = eo_y - pc_y
     dz = eo_z - pc_z
 
-    # ── 4. Hitung jarak horizontal d dan sudut inklinasi r ─────────
-    # np.hypot lebih stabil secara numerik dibanding sqrt(dx²+dy²)
+    # 4. Calculate horizontal distance d and refraction angle r
+    # np.hypot more stable numerically than sqrt(dx²+dy²)
     # d = Euclidean distance to the SfM point from the camera
     # r = angle of refraction (from nadir to the SfM point)
     d = np.hypot(dx, dy)                      # (N_pt, N_cam)
-    r = np.rad2deg(np.arctan2(d, dz))         # arctan2 aman saat dz=0
+    r = np.rad2deg(np.arctan2(d, dz))         # arctan2 safe while dz=0
 
-    # ── 5. Masking: sembunyikan r yang tidak visible → NaN ─────────
-    # Gunakan np.where dengan vis bool — TIDAK memakai r*vis==0
-    # sehingga titik dengan r=0 yang benar-benar visible tidak ikut hilang
+    # 5. Masking: NaN for invisible points or ifov with NaN
     r_filter = np.where(vis, r, np.nan)         # (N_pt, N_cam)
 
     return r_filter
