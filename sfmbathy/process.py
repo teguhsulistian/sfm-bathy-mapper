@@ -98,6 +98,9 @@ def ifov_calculation(eo, sensor, mean_elev, chunk_size=1000, n_jobs=1, verbose=T
     """
     N = eo.shape[0]
 
+    eo = pd.read_csv(eo)
+    sensor = pd.read_csv(sensor)
+
     # Convert sensor dimensions to meters
     f  = sensor.focal[0]    * 1e-3
     sx = sensor.sensor_x[0] * 5e-4   # /2 * 0.001
@@ -215,9 +218,6 @@ def _contains_single(args):
 
 def visible_points(eo, ifov, pc, n_jobs=1, verbose=False):
     """
-    Cek visibilitas titik point cloud (pc) terhadap setiap kamera (eo),
-    dan hitung sudut inklinasi r (untuk koreksi refraksi).
-
     Point cloud (pc) which is visible from a camera is determined by whether its (x,y) coordinates
     and calculated inclination angle r fall within the camera's instantaneous field of view (ifov) polygon.
 
@@ -235,8 +235,11 @@ def visible_points(eo, ifov, pc, n_jobs=1, verbose=False):
         inclination angle in degrees. NaN if the point is not visible
         from the camera, or if the ifov contains NaN.
     """
+    
+    eo = pd.read_csv(eo)
     n_cam = eo.shape[0]
     n_pt  = pc.shape[0]
+    
 
     # 1. Prepare pc coordinates once for all cameras
     # Shape (N_pt, 2) — used repeatedly for all cameras
