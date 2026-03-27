@@ -74,7 +74,7 @@ def _build_rotation_matrices(pitches, yaws, rolls):
     return R
 
 
-def footprints(cam, sensor, base_elev, chunk_size=1000, n_jobs=1, verbose=True):
+def ifov_calculation(eo, sensor, mean_elev, chunk_size=1000, n_jobs=1, verbose=True):
     """
     Calculate the Instantaneous Field of View (IFOV) for each camera.
 
@@ -82,9 +82,9 @@ def footprints(cam, sensor, base_elev, chunk_size=1000, n_jobs=1, verbose=True):
 
     Parameters
     ----------
-    cam        : pd.DataFrame (N × ≥6) — columns: x, y, z, yaw, pitch, roll
+    eo         : pd.DataFrame (N × ≥6) — columns: x, y, z, yaw, pitch, roll (exterior orientation)
     sensor     : pd.DataFrame (1 × 3)  — columns: focal (mm), sensor_x (mm), sensor_y (mm)
-    base_elev  : float  — average ground elevation (meters)
+    mean_elev  : float  — average ground elevation (meters)
     chunk_size : int    — batch processing size (default 1000; reduce if RAM is limited)
     n_jobs     : int    — number of parallel processes (default 1; use -1 for all CPU cores)
     verbose    : bool   — display progress
@@ -95,7 +95,7 @@ def footprints(cam, sensor, base_elev, chunk_size=1000, n_jobs=1, verbose=True):
     Cameras that exceed the critical pitch will have Path objects containing NaN.
 
     """
-    N = cam.shape[0]
+    N = eo.shape[0]
 
     # ── Convert sensor dimensions to meters ──
     f  = sensor.focal[0]    * 1e-3
@@ -110,12 +110,12 @@ def footprints(cam, sensor, base_elev, chunk_size=1000, n_jobs=1, verbose=True):
         sys.stdout.flush()
 
     # ── Extract NumPy arrays from DataFrame ──
-    xs     = cam['x'].to_numpy(dtype=np.float64)
-    ys     = cam['y'].to_numpy(dtype=np.float64)
-    zs     = cam['z'].to_numpy(dtype=np.float64)
-    yaws   = np.deg2rad(cam['yaw'].to_numpy(dtype=np.float64))
-    pitches_raw = cam['pitch'].to_numpy(dtype=np.float64)
-    rolls  = np.deg2rad(cam['roll'].to_numpy(dtype=np.float64))
+    xs     = eo['x'].to_numpy(dtype=np.float64)
+    ys     = eo['y'].to_numpy(dtype=np.float64)
+    zs     = eo['z'].to_numpy(dtype=np.float64)
+    yaws   = np.deg2rad(eo['yaw'].to_numpy(dtype=np.float64))
+    pitches_raw = eo['pitch'].to_numpy(dtype=np.float64)
+    rolls  = np.deg2rad(eo['roll'].to_numpy(dtype=np.float64))
 
     # Pitch for rotation: 90 - pitch_raw (in radians) for correct orientation
     pitches = np.deg2rad(90.0 - pitches_raw)
@@ -171,8 +171,8 @@ def footprints(cam, sensor, base_elev, chunk_size=1000, n_jobs=1, verbose=True):
         dirs_flat    = cam_pts_flat - origins_flat                            # (n_chunk*4, 3)
 
         # Normalization of ray directions
-        # Using plane_z = base_elev
-        xy_flat = _ray_plane_intersect_batch(origins_flat, dirs_flat, base_elev)  # (n_chunk*4, 2)
+        # Using plane_z = mean_elev
+        xy_flat = _ray_plane_intersect_batch(origins_flat, dirs_flat, mean_elev)  # (n_chunk*4, 2)
 
         # Reshape → (n_chunk, 4, 2)
         xy_chunk = xy_flat.reshape(n_chunk, 4, 2)
@@ -189,7 +189,7 @@ def footprints(cam, sensor, base_elev, chunk_size=1000, n_jobs=1, verbose=True):
 
     if verbose:
         n_invalid = int((~valid_mask).sum())
-        print(f"Selesai. {N - n_invalid:,} footprint valid, {n_invalid:,} NaN (critical pitch).")
+        print(f"Finished {N - n_invalid:,} footprint valid, {n_invalid:,} NaN (critical pitch).")
 
     return result
 
