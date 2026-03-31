@@ -1,4 +1,5 @@
 import sys
+import warnings
 import laspy
 import numpy as np
 import pandas as pd
@@ -9,7 +10,7 @@ from shapely import points as shp_points   # vectorized C-level constructor
 from multiprocessing import Pool, cpu_count
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, issparse
 
 
 def _ray_plane_intersect_batch(ray_origins, ray_dirs, plane_z):
@@ -174,10 +175,10 @@ def ifov_calculation(eo, sensor, mean_elev, chunk_size=1000, n_jobs=1, verbose=T
         # Ray–Plane intersection for all (camera × corner) simultaneously
         # Ray: from corners_world through cam_pts, direction = cam_pts - corners_world
         # Flatten to (n_chunk*4, 3)
-            
-        origins_flat = corners_world.reshape(-1, 3)                          # (n_chunk*4, 3)
+                    
         cam_pts_flat = np.repeat(cam_pts, 4, axis=0)                         # (n_chunk*4, 3)
-        dirs_flat    = cam_pts_flat - origins_flat                            # (n_chunk*4, 3)
+        origins_flat = corners_world.reshape(-1, 3)                          # (n_chunk*4, 3) 
+        dirs_flat    = origins_flat - cam_pts_flat                           # (n_chunk*4, 3) # Changed origin_flat - cam_pts_flat to cam_pts_flat - origin_flat for correct ray direction from camera to corner
 
         # Normalization of ray directions
         # Using plane_z = mean_elev
@@ -394,7 +395,7 @@ def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
         poly = polys[ci]
         if poly is None:
             return None
-        pt_idxs = pt_tree.query(poly, predicate='contains')
+        pt_idxs = pt_tree.query(poly, predicate='contains')  # indeks titik yang masuk polygon
         if len(pt_idxs) == 0:
             return None
  
@@ -448,7 +449,7 @@ def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
         print(f"Memory sparse: {mem_sparse_mb:.1f} MB  "
               f"(vs {n_pt * n_cam * 8 / 1e9:.1f} GB dense)")
  
-    return r_sparse
+    return r_sparse, polys
  
  
 # ─────────────────────────────────────────────────────────────────
@@ -494,8 +495,115 @@ def to_dataframe(r_sparse):
     })
 
 
+def process_refraction(r, pc, wl, n_water="default"):
+    """
+    Koreksi kedalaman point cloud terhadap efek refraksi cahaya di air
+    berdasarkan multi-view stereo photogrammetry.
+ 
+    Parameters
+    ----------
+    r        : scipy.sparse.csr_matrix (N_pt, N_cam) atau ndarray (N_pt, N_cam)
+               Sudut inklinasi dalam derajat dari visible_points().
+               Sparse: nilai 0 = tidak visible. Dense: NaN = tidak visible.
+    pc       : ndarray (N_pt, ≥3)
+               Point cloud dengan kolom [x, y, z, ...].
+    wl       : float
+               Water level / tide height saat akuisisi data (meter).
+    n_water  : float atau "default"
+               Indeks refraksi air (default 1.33 untuk cahaya tampak).
+ 
+    Returns
+    -------
+    pc_corrected : ndarray (N_pt, ≥3)
+               Point cloud dengan z yang sudah dikoreksi refraksi.
+               Titik di atas wl tidak diubah.
+               Titik tanpa visible camera dipertahankan z aslinya.
+    r_mean   : ndarray (N_pt,)
+               Sudut r rata-rata per titik (radian), NaN jika tidak visible.
+    """
+ 
+    # ── 1. Refractive index ────────────────────────────────────────
+    n_water = 1.33 if n_water == "default" else float(n_water)
+ 
+    # ── 2. Aggregate r → satu nilai per titik ─────────────────────
+    # r bisa sparse matrix (output visible_points baru) atau dense ndarray
+    # Tiap titik bisa terlihat dari beberapa kamera dengan sudut r berbeda
+    # → ambil mean dari semua kamera yang melihat titik tersebut
+ 
+    if issparse(r):
+        # Sparse: nilai 0 berarti tidak visible, bukan r=0°
+        # Hitung mean hanya dari elemen non-zero per baris
+        r_dense = r.toarray().astype(np.float64)  # (N_pt, N_cam)
+        r_dense[r_dense == 0] = np.nan             # 0 → NaN agar tidak masuk mean
+    else:
+        r_dense = np.asarray(r, dtype=np.float64)  # sudah NaN untuk tidak visible
+ 
+    # nanmean per baris → (N_pt,) — NaN jika semua kamera tidak melihat titik ini
+    # RuntimeWarning "Mean of empty slice" adalah expected untuk titik tidak visible
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        r_mean_deg = np.nanmean(r_dense, axis=1)   # (N_pt,) derajat
+ 
+    # ── 3. Filter titik di bawah dan di atas air ───────────────────
+    # BUG FIX: definisikan mask dulu, BARU gunakan
+    below_mask = pc[:, 2] < wl     # (N_pt,) bool
+    above_mask = ~below_mask
+ 
+    pc_below = pc[below_mask].copy()    # titik di bawah wl — akan dikoreksi
+    pc_above = pc[above_mask].copy()    # titik di atas wl  — tidak diubah
+ 
+    # r_mean untuk titik di bawah air saja
+    r_sub_deg = r_mean_deg[below_mask]  # (N_sub,) derajat
+ 
+    if verbose_flag := len(pc_below) > 0:
+        print(f"Titik di bawah wl : {len(pc_below):,} "
+              f"({100*len(pc_below)/len(pc):.2f}%)")
+        print(f"Titik di atas wl  : {len(pc_above):,} "
+              f"({100*len(pc_above)/len(pc):.2f}%)")
+ 
+    # ── 4. Koreksi refraksi hanya pada titik yang punya r valid ────
+    valid = ~np.isnan(r_sub_deg)   # titik yang terlihat minimal satu kamera
+ 
+    if valid.any():
+        rad_r = np.deg2rad(r_sub_deg[valid])   # sudut di udara (radian)
+ 
+        # Snell's law: n_air * sin(r) = n_water * sin(i)
+        # n_air = 1.0
+        sin_i = (1.0 / n_water) * np.sin(rad_r)
+        # Klem ke [-1, 1] untuk menghindari domain error arcsin
+        sin_i = np.clip(sin_i, -1.0, 1.0)
+        rad_i = np.arcsin(sin_i)               # sudut di air (radian)
+ 
+        # Jarak horizontal dari titik SfM ke titik perpotongan air-udara
+        # xd = kedalaman_apparent × tan(r)
+        depth_apparent = wl - pc_below[valid, 2]     # positif (titik di bawah wl)
+        xd = depth_apparent * np.tan(rad_r)
+ 
+        # Kedalaman sebenarnya = xd / tan(i)
+        # pc_below[valid, 2] = wl - xd / tan(rad_i)
+        tan_i = np.tan(rad_i)
+        # Hindari division by zero (sudut sangat kecil → tan ≈ 0)
+        safe_tan_i = np.where(np.abs(tan_i) > 1e-10, tan_i, np.nan)
+        depth_true = xd / safe_tan_i
+ 
+        pc_below[valid, 2] = wl - depth_true
+ 
+    n_no_camera = int((~valid).sum())
+    if n_no_camera > 0:
+        print(f"Peringatan: {n_no_camera:,} titik di bawah wl tidak "
+              f"terlihat kamera manapun — z tidak dikoreksi.")
+ 
+    # ── 5. Gabung kembali ──────────────────────────────────────────
+    pc_corrected = np.vstack((pc_below, pc_above))
+ 
+    print(f"Point cloud asli   : {len(pc):,} titik")
+    print(f"Point cloud koreksi: {len(pc_corrected):,} titik")
+ 
+    return pc_corrected, r_mean_deg
 
-def process_refraction(r, pc, wl, n_water):
+
+
+# def process_refraction(r, pc, wl, n_water):
     """
     Process correcting for point cloud depth based on multi-view stereo photogrammetry
     
