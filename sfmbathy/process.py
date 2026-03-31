@@ -3,8 +3,13 @@ import laspy
 import numpy as np
 import pandas as pd
 import matplotlib.path as mplPath
+from shapely.geometry import Polygon
+from shapely import STRtree
+from shapely import points as shp_points   # vectorized C-level constructor
 from multiprocessing import Pool, cpu_count
 from functools import partial
+from concurrent.futures import ThreadPoolExecutor
+from scipy.sparse import csr_matrix
 
 
 def _ray_plane_intersect_batch(ray_origins, ray_dirs, plane_z):
@@ -96,11 +101,11 @@ def ifov_calculation(eo, sensor, mean_elev, chunk_size=1000, n_jobs=1, verbose=T
     Cameras that exceed the critical pitch will have Path objects containing NaN.
 
     """
-    N = eo.shape[0]
-
     eo = pd.read_csv(eo)
     sensor = pd.read_csv(sensor)
-
+    
+    N = eo.shape[0]
+   
     # Convert sensor dimensions to meters
     f  = sensor.focal[0]    * 1e-3
     sx = sensor.sensor_x[0] * 5e-4   # /2 * 0.001
@@ -184,7 +189,7 @@ def ifov_calculation(eo, sensor, mean_elev, chunk_size=1000, n_jobs=1, verbose=T
         all_inter[chunk_idx] = xy_chunk
 
         if verbose and (start + n_chunk) % max(chunk_size * 5, 1000) < chunk_size:
-            print(f"  {start + n_chunk:,} / {len(indices):,} kamera valid diproses...")
+            print(f"  {start + n_chunk:,} / {len(indices):,} Valid cameras processed...")
             sys.stdout.flush()
 
     # Output DataFrame
@@ -216,7 +221,7 @@ def _contains_single(args):
     return path.contains_points(pc_xy)
 
 
-def visible_points(eo, ifov, pc, n_jobs=1, verbose=False):
+# def visible_points(eo, ifov, pc, n_jobs=1, verbose=False):
     """
     Point cloud (pc) which is visible from a camera is determined by whether its (x,y) coordinates
     and calculated inclination angle r fall within the camera's instantaneous field of view (ifov) polygon.
@@ -244,8 +249,8 @@ def visible_points(eo, ifov, pc, n_jobs=1, verbose=False):
     # 1. Prepare pc coordinates once for all cameras
     # Shape (N_pt, 2) — used repeatedly for all cameras
     pc_xy = np.column_stack([
-        pc['x'].to_numpy(dtype=np.float64),
-        pc['y'].to_numpy(dtype=np.float64),
+        pc[:,0].astype(np.float64),
+        pc[:,1].astype(np.float64),
     ])
 
     # 2. Visibility calculating for each constains_points
@@ -281,9 +286,9 @@ def visible_points(eo, ifov, pc, n_jobs=1, verbose=False):
     eo_y = eo['y'].to_numpy(dtype=np.float64)[np.newaxis, :]
     eo_z = eo['z'].to_numpy(dtype=np.float64)[np.newaxis, :]
 
-    pc_x = pc['x'].to_numpy(dtype=np.float64)[:, np.newaxis]   # (N_pt, 1)
-    pc_y = pc['y'].to_numpy(dtype=np.float64)[:, np.newaxis]
-    pc_z = pc['z'].to_numpy(dtype=np.float64)[:, np.newaxis]
+    pc_x = pc[:, 0:1].astype(np.float64)
+    pc_y = pc[:, 1:2].astype(np.float64)
+    pc_z = pc[:, 2:3].astype(np.float64)
 
     dx = eo_x - pc_x   # (N_pt, N_cam)
     dy = eo_y - pc_y
@@ -300,6 +305,195 @@ def visible_points(eo, ifov, pc, n_jobs=1, verbose=False):
     r_filter = np.where(vis, r, np.nan)         # (N_pt, N_cam)
 
     return r_filter
+
+
+def _path_to_polygon(mpl_path):
+    """Konversi matplotlib Path → Shapely Polygon. NaN path → None."""
+    verts = mpl_path.vertices
+    if np.any(np.isnan(verts)):
+        return None
+    return Polygon(verts)
+ 
+ 
+# ─────────────────────────────────────────────────────────────────
+# FUNGSI UTAMA
+# ─────────────────────────────────────────────────────────────────
+ 
+def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
+    """
+    Tentukan visibilitas titik point cloud terhadap setiap kamera
+    dan hitung sudut inklinasi r. Output dalam format sparse matrix
+    untuk efisiensi memori maksimal.
+ 
+    Parameters
+    ----------
+    eo         : pd.DataFrame (N_cam × ≥3) — kolom: x, y, z
+    ifov       : pd.DataFrame (N_cam × 1)  — kolom: fov (matplotlib Path)
+    pc         : ndarray (N_pt × ≥3)       — kolom: x, y, z
+    n_jobs     : int  — jumlah thread (1=serial, -1=semua CPU)
+    chunk_size : int  — jumlah kamera per chunk (turunkan jika RAM masih terbatas)
+    verbose    : bool — tampilkan progress
+ 
+    Returns
+    -------
+    r_sparse : scipy.sparse.csr_matrix, shape (N_pt, N_cam), dtype float32
+        Sudut inklinasi dalam derajat untuk pasangan yang visible.
+        Nilai 0 dalam sparse matrix berarti tidak visible (bukan r=0°).
+        Gunakan r_sparse.nnz untuk jumlah pasangan visible.
+ 
+    Cara menggunakan output:
+        # Ambil semua nilai sebagai dense (hanya jika RAM cukup)
+        r_dense = r_sparse.toarray()
+        r_dense[r_dense == 0] = np.nan
+ 
+        # Iterasi per kamera tanpa dense conversion
+        for ci in range(r_sparse.shape[1]):
+            col = r_sparse.getcol(ci)
+            pt_idxs = col.nonzero()[0]      # indeks titik visible
+            r_vals  = col.data               # nilai r untuk titik tersebut
+ 
+        # Konversi ke DataFrame pasangan visible
+        cx, cy = r_sparse.nonzero()
+        r_vals = np.array(r_sparse[cx, cy]).flatten()
+        df = pd.DataFrame({'pt_idx': cx, 'cam_idx': cy, 'r': r_vals})
+    """
+    n_cam = eo.shape[0]
+    n_pt  = pc.shape[0]
+ 
+    if verbose:
+        mem_dense_gb = n_pt * n_cam * 8 / 1e9
+        print(f"N_pt={n_pt:,}  N_cam={n_cam:,}  "
+              f"(dense seria {mem_dense_gb:.1f} GB — menggunakan sparse)")
+ 
+    # ── 1. Konversi Path → Polygon ─────────────────────────────────
+    polys = [_path_to_polygon(p) for p in ifov['fov']]
+ 
+    # ── 2. Bangun STRtree dari semua titik pc (sekali) ─────────────
+    pc_xy   = pc[:, :2].astype(np.float64)
+    shp_pts = shp_points(pc_xy)          # vectorized, tanpa Python loop
+    pt_tree = STRtree(shp_pts)
+ 
+    # ── 3. Ekstrak koordinat kamera dan pc sebagai array 1D ────────
+    eo_x = eo['x'].to_numpy(np.float64)  # (N_cam,)
+    eo_y = eo['y'].to_numpy(np.float64)
+    eo_z = eo['z'].to_numpy(np.float64)
+    pc_x = pc[:, 0].astype(np.float64)  # (N_pt,)
+    pc_y = pc[:, 1].astype(np.float64)
+    pc_z = pc[:, 2].astype(np.float64)
+ 
+    # ── 4. Akumulasi COO data untuk sparse matrix ──────────────────
+    # COO (Coordinate format): simpan (row, col, value) hanya untuk non-zero
+    rows_list = []
+    cols_list = []
+    vals_list = []
+ 
+    n_workers = cpu_count() if n_jobs == -1 else max(1, n_jobs)
+ 
+    def _process_cam(ci):
+        """Proses satu kamera: query visible pts, hitung r, return COO."""
+        poly = polys[ci]
+        if poly is None:
+            return None
+        pt_idxs = pt_tree.query(poly, predicate='contains')
+        if len(pt_idxs) == 0:
+            return None
+ 
+        # Hitung r hanya untuk titik visible — array kecil (k,) bukan (N_pt,)
+        dx = eo_x[ci] - pc_x[pt_idxs]
+        dy = eo_y[ci] - pc_y[pt_idxs]
+        dz = eo_z[ci] - pc_z[pt_idxs]
+        d  = np.hypot(dx, dy)
+        r  = np.rad2deg(np.arctan2(d, dz)).astype(np.float32)
+ 
+        return pt_idxs, r
+ 
+    # ── 5. Jalankan per chunk kamera ───────────────────────────────
+    cam_indices = range(n_cam)
+ 
+    if n_workers == 1:
+        results = [_process_cam(ci) for ci in cam_indices]
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            results = list(ex.map(_process_cam, cam_indices))
+ 
+    # ── 6. Kumpulkan COO data ──────────────────────────────────────
+    for ci, res in enumerate(results):
+        if res is None:
+            continue
+        pt_idxs, r_vals = res
+        rows_list.append(pt_idxs.astype(np.int32))
+        cols_list.append(np.full(len(pt_idxs), ci, dtype=np.int32))
+        vals_list.append(r_vals)
+ 
+    if not rows_list:
+        # Tidak ada pasangan visible sama sekali
+        return csr_matrix((n_pt, n_cam), dtype=np.float32)
+ 
+    all_rows = np.concatenate(rows_list)
+    all_cols = np.concatenate(cols_list)
+    all_vals = np.concatenate(vals_list)
+ 
+    # ── 7. Bangun sparse matrix ────────────────────────────────────
+    r_sparse = csr_matrix(
+        (all_vals, (all_rows, all_cols)),
+        shape=(n_pt, n_cam),
+        dtype=np.float32
+    )
+ 
+    if verbose:
+        nnz = r_sparse.nnz
+        mem_sparse_mb = (all_vals.nbytes + all_rows.nbytes + all_cols.nbytes) / 1e6
+        print(f"Visible: {nnz:,} / {n_pt * n_cam:,} pasangan "
+              f"({100 * nnz / (n_pt * n_cam):.4f}%)")
+        print(f"Memory sparse: {mem_sparse_mb:.1f} MB  "
+              f"(vs {n_pt * n_cam * 8 / 1e9:.1f} GB dense)")
+ 
+    return r_sparse
+ 
+ 
+# ─────────────────────────────────────────────────────────────────
+# UTILITAS: konversi sparse → dense per kamera (stream, hemat RAM)
+# ─────────────────────────────────────────────────────────────────
+ 
+def iter_camera_results(r_sparse):
+    """
+    Generator: iterasi hasil per kamera tanpa membuat array dense penuh.
+ 
+    Yields
+    ------
+    ci       : int   — indeks kamera
+    pt_idxs  : ndarray (k,) int   — indeks titik visible
+    r_vals   : ndarray (k,) float — sudut r untuk titik tersebut
+    """
+    r_csr = r_sparse.tocsr()
+    r_csc = r_csr.tocsc()   # column-slicing efisien
+    for ci in range(r_csc.shape[1]):
+        start = r_csc.indptr[ci]
+        end   = r_csc.indptr[ci + 1]
+        if end > start:
+            idxs   = r_csc.indices[start:end]
+            r_vals = r_csc.data[start:end].astype(np.float32)
+            yield ci, idxs, r_vals
+ 
+ 
+def to_dataframe(r_sparse):
+    """
+    Konversi sparse matrix ke DataFrame pasangan visible.
+    Hanya gunakan jika jumlah pasangan visible tidak terlalu besar.
+ 
+    Returns
+    -------
+    pd.DataFrame dengan kolom: pt_idx, cam_idx, r
+    """
+    cx, cy = r_sparse.nonzero()
+    r_vals = np.asarray(r_sparse[cx, cy]).flatten()
+    return pd.DataFrame({
+        'pt_idx':  cx.astype(np.int32),
+        'cam_idx': cy.astype(np.int32),
+        'r':       r_vals.astype(np.float32),
+    })
+
+
 
 def process_refraction(r, pc, wl, n_water):
     """
