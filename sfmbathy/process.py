@@ -178,7 +178,7 @@ def ifov_calculation(eo, sensor, mean_elev, chunk_size=1000, n_jobs=1, verbose=T
                     
         cam_pts_flat = np.repeat(cam_pts, 4, axis=0)                         # (n_chunk*4, 3)
         origins_flat = corners_world.reshape(-1, 3)                          # (n_chunk*4, 3) 
-        dirs_flat    = origins_flat - cam_pts_flat                           # (n_chunk*4, 3) # Changed origin_flat - cam_pts_flat to cam_pts_flat - origin_flat for correct ray direction from camera to corner
+        dirs_flat = cam_pts_flat - origins_flat                              # (n_chunk*4, 3) 
 
         # Normalization of ray directions
         # Using plane_z = mean_elev
