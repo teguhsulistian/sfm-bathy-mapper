@@ -495,7 +495,7 @@ def to_dataframe(r_sparse):
     })
 
 
-def process_refraction(r, pc, wl, n_water="default"):
+# def process_refraction(r, pc, wl, n_water="default"):
     """
     Koreksi kedalaman point cloud terhadap efek refraksi cahaya di air
     berdasarkan multi-view stereo photogrammetry.
@@ -602,51 +602,177 @@ def process_refraction(r, pc, wl, n_water="default"):
     return pc_corrected, r_mean_deg
 
 
-
-# def process_refraction(r, pc, wl, n_water):
+# ─────────────────────────────────────────────────────────────────
+# CORE: koreksi refraksi per elemen (fully vectorized)
+# ─────────────────────────────────────────────────────────────────
+ 
+def _refract_depth_per_element(r_deg, z_apparent, wl, n_water):
     """
-    Process correcting for point cloud depth based on multi-view stereo photogrammetry
-    
-    parameters:
-    r       : ndarray (N_pt, N_cam) float64 — angle of refraction in degrees. NaN if the point is not visible from the camera, or if the ifov contains NaN.
-    pc      : (numpy.ndarray) The input point cloud as a Nx6 array (x, y, z, red, green, blue).
-    wl      : float — water level (tide height) at the time of data capture in meters
-    n_water : float or "default" — refractive index of water (default 1.33 for visible light in water)  
-
-    returns:
-    pc_corrected : pd.DataFrame (N_pt × ≥3) — columns: x, y, z (corrected point cloud)
-
+    Hitung kedalaman terkoreksi refraksi untuk setiap pasangan (titik, kamera).
+    Semua operasi vectorized — tidak ada Python loop.
+ 
+    Parameters
+    ----------
+    r_deg      : ndarray (k,) — sudut inklinasi dalam derajat
+    z_apparent : ndarray (k,) — z SfM (apparent) dari titik terkait
+    wl         : float        — water level
+    n_water    : float        — refractive index air
+ 
+    Returns
+    -------
+    depth_corr : ndarray (k,) float64
+        Kedalaman z terkoreksi. NaN jika titik di atas wl atau tan(i) ≈ 0.
     """
-    # 1. Defining the refractive index of water, default is 1.33 for visible light in water
-    if n_water == "default":
-        n_water = 1.33
+    rad_r = np.deg2rad(r_deg)
+ 
+    # Snell's law: sin(i) = sin(r) / n_water
+    sin_i = np.clip((1.0 / n_water) * np.sin(rad_r), -1.0, 1.0)
+    tan_i = np.tan(np.arcsin(sin_i))
+ 
+    # Hanya titik di bawah wl
+    below     = z_apparent < wl
+    depth_app = np.where(below, wl - z_apparent, np.nan)   # apparent depth (positif)
+    xd        = depth_app * np.tan(rad_r)                  # jarak horizontal
+ 
+    # Kedalaman sebenarnya
+    safe_tan  = np.where(np.abs(tan_i) > 1e-10, tan_i, np.nan)
+    return xd / safe_tan   # z_corrected = wl - depth_true
+ 
+ 
+def _mean_depth_bincount(row_idx, depth_corr, n_pt):
+    """
+    Hitung rata-rata depth_corr per titik menggunakan np.bincount.
+    Jauh lebih cepat dari np.add.at karena bincount adalah operasi O(n) C-level.
+ 
+    Returns ndarray (n_pt,) — NaN untuk titik tanpa nilai valid.
+    """
+    valid = ~np.isnan(depth_corr)
+    if not valid.any():
+        return np.full(n_pt, np.nan)
+    s = np.bincount(row_idx[valid], weights=depth_corr[valid], minlength=n_pt)
+    c = np.bincount(row_idx[valid], minlength=n_pt).astype(np.float64)
+    c[c == 0] = np.nan
+    return s / c
+ 
+ 
+# ─────────────────────────────────────────────────────────────────
+# FUNGSI UTAMA
+# ─────────────────────────────────────────────────────────────────
+ 
+def process_refraction(r, pc, wl, n_water="default", n_jobs=1, verbose=True):
+    """
+    Koreksi kedalaman point cloud terhadap efek refraksi cahaya di air.
+ 
+    Untuk setiap titik yang terlihat dari beberapa kamera:
+      1. Hitung kedalaman terkoreksi menggunakan r dari SETIAP kamera
+      2. Rata-ratakan hasil kedalaman terkoreksi dari semua kamera
+ 
+    Parameters
+    ----------
+    r        : scipy.sparse.csr_matrix (N_pt, N_cam) atau ndarray (N_pt, N_cam)
+               Sudut inklinasi dalam derajat dari visible_points().
+               Sparse: nilai 0 = tidak visible. Dense: NaN = tidak visible.
+    pc       : ndarray (N_pt, ≥3) — kolom: x, y, z, ...
+    wl       : float  — water level saat akuisisi data (meter)
+    n_water  : float atau "default" — refractive index air (default 1.33)
+    n_jobs   : int
+               1  = serial (default, terbaik untuk n_vis < 500k)
+               -1 = semua CPU core
+               >1 = jumlah thread eksplisit
+    verbose  : bool — tampilkan ringkasan
+ 
+    Returns
+    -------
+    pc_corrected : ndarray (N_pt, ≥3)
+        Point cloud dengan z terkoreksi refraksi.
+        Titik di atas wl tidak diubah.
+        Titik tanpa visible kamera dipertahankan z aslinya.
+    depth_mean : ndarray (N_pt,)
+        Rata-rata z terkoreksi per titik (dari semua kamera yang melihatnya).
+        NaN jika titik tidak visible dari kamera manapun.
+    """
+ 
+    # ── 1. Setup ───────────────────────────────────────────────────
+    n_water  = 1.33 if n_water == "default" else float(n_water)
+    n_pt     = pc.shape[0]
+    n_workers = cpu_count() if n_jobs == -1 else max(1, n_jobs)
+ 
+    if not issparse(r):
+        # Konversi dense → sparse (NaN → 0)
+        from scipy.sparse import csr_matrix as csr
+        r_arr = np.asarray(r, dtype=np.float32)
+        r_arr[np.isnan(r_arr)] = 0
+        r = csr(r_arr)
+ 
+    r_csr = r.tocsr()
+    n_vis = r_csr.nnz
+ 
+    if verbose:
+        n_cam = r_csr.shape[1]
+        mem_dense_gb = n_pt * n_cam * 8 / 1e9
+        print(f"N_pt={n_pt:,}  N_cam={n_cam}  n_visible={n_vis:,}  "
+              f"(dense seria {mem_dense_gb:.1f} GB)")
+ 
+    # ── 2. Hitung depth terkoreksi per elemen sparse ───────────────
+    # Setiap elemen = satu pasangan (titik, kamera)
+    # row_idx[k] = indeks titik untuk elemen ke-k
+    row_idx = np.repeat(np.arange(n_pt), np.diff(r_csr.indptr))  # (n_vis,)
+    r_data  = r_csr.data.astype(np.float64)                       # (n_vis,) derajat
+    z_elem  = pc[row_idx, 2]                                       # (n_vis,) z tiap titik
+ 
+    if n_workers == 1 or n_vis < 50_000:
+        # ── Serial: satu operasi vectorized untuk semua elemen ────
+        depth_per_elem = _refract_depth_per_element(r_data, z_elem, wl, n_water)
+        depth_mean = _mean_depth_bincount(row_idx, depth_per_elem, n_pt)
+ 
     else:
-        n_water = float(n_water)
+        # ── Parallel: bagi titik (baris) ke n_workers chunk ────────
+        # Setiap worker menangani subset baris → tidak ada overlap
+        # → bincount lokal aman tanpa lock
+        pt_chunks = np.array_split(np.arange(n_pt), n_workers)
+ 
+        def _worker(pt_idx):
+            """Proses subset baris r_csr[pt_idx, :]."""
+            sub      = r_csr[pt_idx, :]               # CSR row slicing
+            r_sub    = sub.data.astype(np.float64)
+            loc_rows = np.repeat(
+                np.arange(len(pt_idx)), np.diff(sub.indptr)
+            )                                          # indeks lokal (0..len-1)
+            z_sub    = pc[pt_idx[loc_rows], 2]
+            dc       = _refract_depth_per_element(r_sub, z_sub, wl, n_water)
+            return _mean_depth_bincount(loc_rows, dc, len(pt_idx))
+ 
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            parts = list(executor.map(_worker, pt_chunks))
+        depth_mean = np.concatenate(parts)
+ 
+    # ── 3. Terapkan koreksi ke point cloud ─────────────────────────
+    pc_corrected = pc.copy()
+ 
+    below_mask = pc[:, 2] < wl
+    valid_corr = below_mask & ~np.isnan(depth_mean)
+ 
+    # z_corrected = wl - depth_mean
+    pc_corrected[valid_corr, 2] = wl - depth_mean[valid_corr]
+ 
+    # ── 4. Ringkasan ───────────────────────────────────────────────
+    if verbose:
+        n_below   = int(below_mask.sum())
+        n_above   = int((~below_mask).sum())
+        n_corrected = int(valid_corr.sum())
+        n_no_cam  = int((below_mask & np.isnan(depth_mean)).sum())
+ 
+        print(f"Titik di bawah wl   : {n_below:,} ({100*n_below/n_pt:.2f}%)")
+        print(f"Titik di atas wl    : {n_above:,} ({100*n_above/n_pt:.2f}%)")
+        print(f"Titik terkoreksi    : {n_corrected:,}")
+        if n_no_cam > 0:
+            print(f"Titik tanpa kamera  : {n_no_cam:,} — z tidak dikoreksi")
+        print(f"Point cloud asli    : {n_pt:,} titik")
+        print(f"Point cloud koreksi : {pc_corrected.shape[0]:,} titik")
+ 
+    return pc_corrected, depth_mean
 
-    # 2. Convert r array to radians
-    rad_r = np.deg2rad(r)
 
-    # 3. Calculate angle of incidence
-    rad_i = np.arcsin(1.0/n_water * np.sin(rad_r))
-
-    # 4. Calculate distance from the SfM point to the air/water interface point  
-    xd = (pc_filtered[:,2]-wl) * np.tan(rad_r)
-
-    # 5. Seperate point cloud into below and above water level
-    pc_filtered = pc[pc[:,2] < wl]
-    pc_land = pc[pc[:,2] >= wl]
-
-    # 5. Calculate the corrected (actual) depth
-    pc_filtered[:,2] = wl - xd/np.tan(rad_i)
-
-
-    pc_corrected = np.vstack((pc_filtered, pc_land))
-
-    print(f"Number of points below water level: {len(pc_filtered)}, percentage: {len(pc_filtered)/len(pc)*100:.2f}%")
-    print(f"Number of points above water level: {len(pc_land)}, percentage: {len(pc_land)/len(pc)*100:.2f}%")   
-    print(f"Original point cloud size: {len(pc)}, Corrected point cloud size: {len(pc_corrected)}")
-    
-    return pc_corrected
 
 def process_small_angle(pc, WL, n_water):
     """

@@ -19,7 +19,7 @@ def load_las(file_path):
     """
     #input las file, return point cloud as numpy array and las object
     las = laspy.read(file_path)
-    xyz = np.asarray([las.x, las.y, las.z], dtype=np.float32).T
+    xyz = np.asarray([las.x, las.y, las.z], dtype=np.float64).T
     rgb = np.asarray([las.red, las.green, las.blue], dtype=np.uint8).T
     pc = np.hstack((xyz, rgb))
     
