@@ -278,7 +278,7 @@ def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
     if verbose:
         mem_dense_gb = n_pt * n_cam * 8 / 1e9
         print(f"N_pt={n_pt:,}  N_cam={n_cam:,}  "
-              f"(dense seria {mem_dense_gb:.1f} GB — menggunakan sparse)")
+              f"(dense serial {mem_dense_gb:.1f} GB — Using Sparse)")
  
     # ── 1. Convert Path → Polygon ─────────────────────────────────
     polys = [_path_to_polygon(p) for p in ifov['fov']]
@@ -525,7 +525,7 @@ def process_refraction(r, pc, wl, n_water="default", n_jobs=1, verbose=True):
         n_cam = r_csr.shape[1]
         mem_dense_gb = n_pt * n_cam * 8 / 1e9
         print(f"N_pt={n_pt:,}  N_cam={n_cam}  n_visible={n_vis:,}  "
-              f"(dense seria {mem_dense_gb:.1f} GB)")
+              f"(dense serial {mem_dense_gb:.1f} GB)")
  
     # ── 2. Compute corrected depth for each sparse element ───────────────
     # Each element represents a single (point, camera) pair.
