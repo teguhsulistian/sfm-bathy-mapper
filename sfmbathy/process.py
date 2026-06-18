@@ -85,7 +85,7 @@ def ifov_calculation(eo, sensor, mean_elev, chunk_size=1000, n_jobs=1, verbose=T
     """
     Calculate the Instantaneous Field of View (IFOV) for each camera.
 
-    This version is fully vectorized using NumPy — no Python loops per camera or per sensor angle, and it does not depend on SymPy.
+    Fully vectorized using NumPy — no Python loops per camera or per sensor angle.
 
     Parameters
     ----------
@@ -205,8 +205,8 @@ def ifov_calculation(eo, sensor, mean_elev, chunk_size=1000, n_jobs=1, verbose=T
 
 def _contains_single(args):
     """
-    Cek apakah pc_xy berada di dalam satu Path object.
-    Diperlukan sebagai fungsi top-level agar bisa di-pickle oleh multiprocessing.
+    Check whether pc_xy is inside a single Path object.
+    Required as a top-level function so it can be pickled by multiprocessing.
 
     Parameters
     ----------
@@ -222,94 +222,8 @@ def _contains_single(args):
     return path.contains_points(pc_xy)
 
 
-# def visible_points(eo, ifov, pc, n_jobs=1, verbose=False):
-    """
-    Point cloud (pc) which is visible from a camera is determined by whether its (x,y) coordinates
-    and calculated inclination angle r fall within the camera's instantaneous field of view (ifov) polygon.
-
-    Parameters
-    ----------
-    eo     : pd.DataFrame (N_cam × ≥6)  — columns: x, y, z, ... (exterior orientation)
-    ifov   : pd.DataFrame (N_cam × 1)   — columns: fov (matplotlib Path, instantaneous FOV)
-    pc     : pd.DataFrame (N_pt × ≥3)   — columns: x, y, z (point cloud)
-    n_jobs : int  — number of parallel processes (default 1; -1 = all CPU)
-    verbose: bool — display progress and summary
-
-    Returns
-    -------
-    r_filter : ndarray (N_pt, N_cam) float64
-        inclination angle in degrees. NaN if the point is not visible
-        from the camera, or if the ifov contains NaN.
-    """
-    
-    eo = pd.read_csv(eo)
-    n_cam = eo.shape[0]
-    n_pt  = pc.shape[0]
-    
-
-    # 1. Prepare pc coordinates once for all cameras
-    # Shape (N_pt, 2) — used repeatedly for all cameras
-    pc_xy = np.column_stack([
-        pc[:,0].astype(np.float64),
-        pc[:,1].astype(np.float64),
-    ])
-
-    # 2. Visibility calculating for each constains_points
-    # Opsi A (serial) — A stack without overhead Pool
-    # Opsi B (parallel) — Distributed in many process
-
-    paths = ifov['fov'].tolist()   # list N_cam Path objects
-
-    if n_jobs == 1:
-        # Serial: Faster than original due to no multiprocessing overhead, especially for small N_cam
-        vis_cols = [p.contains_points(pc_xy) for p in paths]
-
-    else:
-        # Parallel: each process handing one camera's Path.contains_points → faster for large N_cam, but beware of overhead and RAM usage
-        workers = cpu_count() if n_jobs == -1 else n_jobs
-        args = [(p, pc_xy) for p in paths]
-        with Pool(workers) as pool:
-            vis_cols = pool.map(_contains_single, args)
-
-    # Stack list of (N_pt,) → array (N_pt, N_cam), dtype bool
-    vis = np.column_stack(vis_cols)   # shape (N_pt, N_cam)
-
-    if verbose:
-        n_visible = int(vis.sum())
-        print(f"Visible points: {n_visible:,} pasangan pc-kamera terlihat "
-              f"dari {n_pt * n_cam:,} total.")
-
-    # 3. Calculate delta x, y, z from camera to point cloud for all pairs (N_pt, N_cam)
-    # eo_x  : shape (1, N_cam)
-    # pc_x  : shape (N_pt, 1)
-    # result : shape (N_pt, N_cam)  — automatic broadcasting
-    eo_x = eo['x'].to_numpy(dtype=np.float64)[np.newaxis, :]   # (1, N_cam)
-    eo_y = eo['y'].to_numpy(dtype=np.float64)[np.newaxis, :]
-    eo_z = eo['z'].to_numpy(dtype=np.float64)[np.newaxis, :]
-
-    pc_x = pc[:, 0:1].astype(np.float64)
-    pc_y = pc[:, 1:2].astype(np.float64)
-    pc_z = pc[:, 2:3].astype(np.float64)
-
-    dx = eo_x - pc_x   # (N_pt, N_cam)
-    dy = eo_y - pc_y
-    dz = eo_z - pc_z
-
-    # 4. Calculate horizontal distance d and refraction angle r
-    # np.hypot more stable numerically than sqrt(dx²+dy²)
-    # d = Euclidean distance to the SfM point from the camera
-    # r = angle of refraction (from nadir to the SfM point)
-    d = np.hypot(dx, dy)                      # (N_pt, N_cam)
-    r = np.rad2deg(np.arctan2(d, dz))         # arctan2 safe while dz=0
-
-    # 5. Masking: NaN for invisible points or ifov with NaN
-    r_filter = np.where(vis, r, np.nan)         # (N_pt, N_cam)
-
-    return r_filter
-
-
 def _path_to_polygon(mpl_path):
-    """Konversi matplotlib Path → Shapely Polygon. NaN path → None."""
+    """Convert matplotlib Path → Shapely Polygon. NaN path → None."""
     verts = mpl_path.vertices
     if np.any(np.isnan(verts)):
         return None
@@ -317,43 +231,43 @@ def _path_to_polygon(mpl_path):
  
  
 # ─────────────────────────────────────────────────────────────────
-# FUNGSI UTAMA
+# MAIN FUNCTION: Visible points and inclination angle r (sparse output)
 # ─────────────────────────────────────────────────────────────────
  
 def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
     """
-    Tentukan visibilitas titik point cloud terhadap setiap kamera
-    dan hitung sudut inklinasi r. Output dalam format sparse matrix
-    untuk efisiensi memori maksimal.
+    Determine the visibility of point cloud points relative to each camera
+    and compute the inclination angle r. Output in sparse matrix format
+    for maximum memory efficiency.
  
     Parameters
     ----------
-    eo         : pd.DataFrame (N_cam × ≥3) — kolom: x, y, z
-    ifov       : pd.DataFrame (N_cam × 1)  — kolom: fov (matplotlib Path)
-    pc         : ndarray (N_pt × ≥3)       — kolom: x, y, z
-    n_jobs     : int  — jumlah thread (1=serial, -1=semua CPU)
-    chunk_size : int  — jumlah kamera per chunk (turunkan jika RAM masih terbatas)
-    verbose    : bool — tampilkan progress
+    eo         : pd.DataFrame (N_cam × ≥3) — columns: x, y, z
+    ifov       : pd.DataFrame (N_cam × 1)  — columns: fov (matplotlib Path)
+    pc         : ndarray (N_pt × ≥3)       — columns: x, y, z
+    n_jobs     : int  — number of threads (1=serial, -1=all CPUs)
+    chunk_size : int  — number of cameras per chunk (reduce if RAM is still limited)
+    verbose    : bool — show progress
  
     Returns
     -------
     r_sparse : scipy.sparse.csr_matrix, shape (N_pt, N_cam), dtype float32
-        Sudut inklinasi dalam derajat untuk pasangan yang visible.
-        Nilai 0 dalam sparse matrix berarti tidak visible (bukan r=0°).
-        Gunakan r_sparse.nnz untuk jumlah pasangan visible.
+        Inclination angle in degrees for visible pairs.
+        A value of 0 in the sparse matrix means not visible (not r=0°).
+        Use r_sparse.nnz for the number of visible pairs.
  
-    Cara menggunakan output:
-        # Ambil semua nilai sebagai dense (hanya jika RAM cukup)
+    How to use the output:
+        # Retrieve all values as dense (only if RAM is sufficient)
         r_dense = r_sparse.toarray()
         r_dense[r_dense == 0] = np.nan
  
-        # Iterasi per kamera tanpa dense conversion
+        # Iterate per camera without dense conversion
         for ci in range(r_sparse.shape[1]):
             col = r_sparse.getcol(ci)
-            pt_idxs = col.nonzero()[0]      # indeks titik visible
-            r_vals  = col.data               # nilai r untuk titik tersebut
+            pt_idxs = col.nonzero()[0]      # indices of visible points
+            r_vals  = col.data               # r values for those points
  
-        # Konversi ke DataFrame pasangan visible
+        # Convert to DataFrame of visible pairs
         cx, cy = r_sparse.nonzero()
         r_vals = np.array(r_sparse[cx, cy]).flatten()
         df = pd.DataFrame({'pt_idx': cx, 'cam_idx': cy, 'r': r_vals})
@@ -366,15 +280,15 @@ def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
         print(f"N_pt={n_pt:,}  N_cam={n_cam:,}  "
               f"(dense seria {mem_dense_gb:.1f} GB — menggunakan sparse)")
  
-    # ── 1. Konversi Path → Polygon ─────────────────────────────────
+    # ── 1. Convert Path → Polygon ─────────────────────────────────
     polys = [_path_to_polygon(p) for p in ifov['fov']]
  
-    # ── 2. Bangun STRtree dari semua titik pc (sekali) ─────────────
+    # ── 2. Build STRtree from all points pc (once) ─────────────
     pc_xy   = pc[:, :2].astype(np.float64)
-    shp_pts = shp_points(pc_xy)          # vectorized, tanpa Python loop
+    shp_pts = shp_points(pc_xy)          # vectorized, without Python loop
     pt_tree = STRtree(shp_pts)
  
-    # ── 3. Ekstrak koordinat kamera dan pc sebagai array 1D ────────
+    # ── 3. Extract camera and pc coordinates as 1D arrays ────────
     eo_x = eo['x'].to_numpy(np.float64)  # (N_cam,)
     eo_y = eo['y'].to_numpy(np.float64)
     eo_z = eo['z'].to_numpy(np.float64)
@@ -382,8 +296,8 @@ def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
     pc_y = pc[:, 1].astype(np.float64)
     pc_z = pc[:, 2].astype(np.float64)
  
-    # ── 4. Akumulasi COO data untuk sparse matrix ──────────────────
-    # COO (Coordinate format): simpan (row, col, value) hanya untuk non-zero
+    # ── 4. Accumulate COO data for sparse matrix ──────────────────
+    # COO (Coordinate format): store (row, col, value) only for non-zero entries
     rows_list = []
     cols_list = []
     vals_list = []
@@ -391,15 +305,15 @@ def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
     n_workers = cpu_count() if n_jobs == -1 else max(1, n_jobs)
  
     def _process_cam(ci):
-        """Proses satu kamera: query visible pts, hitung r, return COO."""
+        """Process a single camera: query visible points, calculate r, return COO."""
         poly = polys[ci]
         if poly is None:
             return None
-        pt_idxs = pt_tree.query(poly, predicate='contains')  # indeks titik yang masuk polygon
+        pt_idxs = pt_tree.query(poly, predicate='contains')  # indices of points inside the polygon
         if len(pt_idxs) == 0:
             return None
  
-        # Hitung r hanya untuk titik visible — array kecil (k,) bukan (N_pt,)
+        # Compute r only for visible points — small array (k,) not (N_pt,)
         dx = eo_x[ci] - pc_x[pt_idxs]
         dy = eo_y[ci] - pc_y[pt_idxs]
         dz = eo_z[ci] - pc_z[pt_idxs]
@@ -408,7 +322,7 @@ def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
  
         return pt_idxs, r
  
-    # ── 5. Jalankan per chunk kamera ───────────────────────────────
+    # ── 5. Run per chunk Camera ───────────────────────────────
     cam_indices = range(n_cam)
  
     if n_workers == 1:
@@ -417,7 +331,7 @@ def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
         with ThreadPoolExecutor(max_workers=n_workers) as ex:
             results = list(ex.map(_process_cam, cam_indices))
  
-    # ── 6. Kumpulkan COO data ──────────────────────────────────────
+    # ── 6. Accumulate COO data ──────────────────────────────────────
     for ci, res in enumerate(results):
         if res is None:
             continue
@@ -427,14 +341,14 @@ def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
         vals_list.append(r_vals)
  
     if not rows_list:
-        # Tidak ada pasangan visible sama sekali
+        # No visible pairs at all
         return csr_matrix((n_pt, n_cam), dtype=np.float32)
  
     all_rows = np.concatenate(rows_list)
     all_cols = np.concatenate(cols_list)
     all_vals = np.concatenate(vals_list)
  
-    # ── 7. Bangun sparse matrix ────────────────────────────────────
+    # ── 7. Build sparse matrix ────────────────────────────────────
     r_sparse = csr_matrix(
         (all_vals, (all_rows, all_cols)),
         shape=(n_pt, n_cam),
@@ -453,18 +367,18 @@ def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
  
  
 # ─────────────────────────────────────────────────────────────────
-# UTILITAS: konversi sparse → dense per kamera (stream, hemat RAM)
+# UTILITIES: sparse conversion → dense per camera (stream, RAM efficient)
 # ─────────────────────────────────────────────────────────────────
  
 def iter_camera_results(r_sparse):
     """
-    Generator: iterasi hasil per kamera tanpa membuat array dense penuh.
+    Generator: iterate through results per camera without creating a full dense array.
  
     Yields
     ------
-    ci       : int   — indeks kamera
-    pt_idxs  : ndarray (k,) int   — indeks titik visible
-    r_vals   : ndarray (k,) float — sudut r untuk titik tersebut
+    ci       : int   — camera index
+    pt_idxs  : ndarray (k,) int   — indices of visible points
+    r_vals   : ndarray (k,) float — angle r for those points
     """
     r_csr = r_sparse.tocsr()
     r_csc = r_csr.tocsc()   # column-slicing efisien
@@ -479,12 +393,12 @@ def iter_camera_results(r_sparse):
  
 def to_dataframe(r_sparse):
     """
-    Konversi sparse matrix ke DataFrame pasangan visible.
-    Hanya gunakan jika jumlah pasangan visible tidak terlalu besar.
+    Convert sparse matrix to DataFrame of visible pairs.
+    Only use if the number of visible pairs is not too large.
  
     Returns
     -------
-    pd.DataFrame dengan kolom: pt_idx, cam_idx, r
+    pd.DataFrame with columns: pt_idx, cam_idx, r
     """
     cx, cy = r_sparse.nonzero()
     r_vals = np.asarray(r_sparse[cx, cy]).flatten()
@@ -495,133 +409,27 @@ def to_dataframe(r_sparse):
     })
 
 
-# def process_refraction(r, pc, wl, n_water="default"):
-    """
-    Koreksi kedalaman point cloud terhadap efek refraksi cahaya di air
-    berdasarkan multi-view stereo photogrammetry.
- 
-    Parameters
-    ----------
-    r        : scipy.sparse.csr_matrix (N_pt, N_cam) atau ndarray (N_pt, N_cam)
-               Sudut inklinasi dalam derajat dari visible_points().
-               Sparse: nilai 0 = tidak visible. Dense: NaN = tidak visible.
-    pc       : ndarray (N_pt, ≥3)
-               Point cloud dengan kolom [x, y, z, ...].
-    wl       : float
-               Water level / tide height saat akuisisi data (meter).
-    n_water  : float atau "default"
-               Indeks refraksi air (default 1.33 untuk cahaya tampak).
- 
-    Returns
-    -------
-    pc_corrected : ndarray (N_pt, ≥3)
-               Point cloud dengan z yang sudah dikoreksi refraksi.
-               Titik di atas wl tidak diubah.
-               Titik tanpa visible camera dipertahankan z aslinya.
-    r_mean   : ndarray (N_pt,)
-               Sudut r rata-rata per titik (radian), NaN jika tidak visible.
-    """
- 
-    # ── 1. Refractive index ────────────────────────────────────────
-    n_water = 1.33 if n_water == "default" else float(n_water)
- 
-    # ── 2. Aggregate r → satu nilai per titik ─────────────────────
-    # r bisa sparse matrix (output visible_points baru) atau dense ndarray
-    # Tiap titik bisa terlihat dari beberapa kamera dengan sudut r berbeda
-    # → ambil mean dari semua kamera yang melihat titik tersebut
- 
-    if issparse(r):
-        # Sparse: nilai 0 berarti tidak visible, bukan r=0°
-        # Hitung mean hanya dari elemen non-zero per baris
-        r_dense = r.toarray().astype(np.float64)  # (N_pt, N_cam)
-        r_dense[r_dense == 0] = np.nan             # 0 → NaN agar tidak masuk mean
-    else:
-        r_dense = np.asarray(r, dtype=np.float64)  # sudah NaN untuk tidak visible
- 
-    # nanmean per baris → (N_pt,) — NaN jika semua kamera tidak melihat titik ini
-    # RuntimeWarning "Mean of empty slice" adalah expected untuk titik tidak visible
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        r_mean_deg = np.nanmean(r_dense, axis=1)   # (N_pt,) derajat
- 
-    # ── 3. Filter titik di bawah dan di atas air ───────────────────
-    # BUG FIX: definisikan mask dulu, BARU gunakan
-    below_mask = pc[:, 2] < wl     # (N_pt,) bool
-    above_mask = ~below_mask
- 
-    pc_below = pc[below_mask].copy()    # titik di bawah wl — akan dikoreksi
-    pc_above = pc[above_mask].copy()    # titik di atas wl  — tidak diubah
- 
-    # r_mean untuk titik di bawah air saja
-    r_sub_deg = r_mean_deg[below_mask]  # (N_sub,) derajat
- 
-    if verbose_flag := len(pc_below) > 0:
-        print(f"Titik di bawah wl : {len(pc_below):,} "
-              f"({100*len(pc_below)/len(pc):.2f}%)")
-        print(f"Titik di atas wl  : {len(pc_above):,} "
-              f"({100*len(pc_above)/len(pc):.2f}%)")
- 
-    # ── 4. Koreksi refraksi hanya pada titik yang punya r valid ────
-    valid = ~np.isnan(r_sub_deg)   # titik yang terlihat minimal satu kamera
- 
-    if valid.any():
-        rad_r = np.deg2rad(r_sub_deg[valid])   # sudut di udara (radian)
- 
-        # Snell's law: n_air * sin(r) = n_water * sin(i)
-        # n_air = 1.0
-        sin_i = (1.0 / n_water) * np.sin(rad_r)
-        # Klem ke [-1, 1] untuk menghindari domain error arcsin
-        sin_i = np.clip(sin_i, -1.0, 1.0)
-        rad_i = np.arcsin(sin_i)               # sudut di air (radian)
- 
-        # Jarak horizontal dari titik SfM ke titik perpotongan air-udara
-        # xd = kedalaman_apparent × tan(r)
-        depth_apparent = wl - pc_below[valid, 2]     # positif (titik di bawah wl)
-        xd = depth_apparent * np.tan(rad_r)
- 
-        # Kedalaman sebenarnya = xd / tan(i)
-        # pc_below[valid, 2] = wl - xd / tan(rad_i)
-        tan_i = np.tan(rad_i)
-        # Hindari division by zero (sudut sangat kecil → tan ≈ 0)
-        safe_tan_i = np.where(np.abs(tan_i) > 1e-10, tan_i, np.nan)
-        depth_true = xd / safe_tan_i
- 
-        pc_below[valid, 2] = wl - depth_true
- 
-    n_no_camera = int((~valid).sum())
-    if n_no_camera > 0:
-        print(f"Peringatan: {n_no_camera:,} titik di bawah wl tidak "
-              f"terlihat kamera manapun — z tidak dikoreksi.")
- 
-    # ── 5. Gabung kembali ──────────────────────────────────────────
-    pc_corrected = np.vstack((pc_below, pc_above))
- 
-    print(f"Point cloud asli   : {len(pc):,} titik")
-    print(f"Point cloud koreksi: {len(pc_corrected):,} titik")
- 
-    return pc_corrected, r_mean_deg
-
-
 # ─────────────────────────────────────────────────────────────────
-# CORE: koreksi refraksi per elemen (fully vectorized)
+# CORE: Refraction Correction per element (fully vectorized)
 # ─────────────────────────────────────────────────────────────────
  
 def _refract_depth_per_element(r_deg, z_apparent, wl, n_water):
     """
-    Hitung kedalaman terkoreksi refraksi untuk setiap pasangan (titik, kamera).
-    Semua operasi vectorized — tidak ada Python loop.
- 
+    Calculate the refraction-corrected depth for each (point, camera) pair.
+    All operations are vectorized — no Python loops.
+
     Parameters
     ----------
-    r_deg      : ndarray (k,) — sudut inklinasi dalam derajat
-    z_apparent : ndarray (k,) — z SfM (apparent) dari titik terkait
+    r_deg      : ndarray (k,) — inclination angle in degrees
+    z_apparent : ndarray (k,) — SfM-derived z value (apparent depth) of the corresponding point
     wl         : float        — water level
-    n_water    : float        — refractive index air
- 
+    n_water    : float        — refractive index of water
+
     Returns
     -------
     depth_corr : ndarray (k,) float64
-        Kedalaman z terkoreksi. NaN jika titik di atas wl atau tan(i) ≈ 0.
+    Refraction-corrected depth (z value).
+    Returns NaN if the point is above the water level (wl) or if tan(i) ≈ 0.
     """
     rad_r = np.deg2rad(r_deg)
  
@@ -629,22 +437,22 @@ def _refract_depth_per_element(r_deg, z_apparent, wl, n_water):
     sin_i = np.clip((1.0 / n_water) * np.sin(rad_r), -1.0, 1.0)
     tan_i = np.tan(np.arcsin(sin_i))
  
-    # Hanya titik di bawah wl
+    # Process points below water level
     below     = z_apparent < wl
     depth_app = np.where(below, wl - z_apparent, np.nan)   # apparent depth (positif)
     xd        = depth_app * np.tan(rad_r)                  # jarak horizontal
  
-    # Kedalaman sebenarnya
+    # True depth
     safe_tan  = np.where(np.abs(tan_i) > 1e-10, tan_i, np.nan)
     return xd / safe_tan   # z_corrected = wl - depth_true
  
  
 def _mean_depth_bincount(row_idx, depth_corr, n_pt):
     """
-    Hitung rata-rata depth_corr per titik menggunakan np.bincount.
-    Jauh lebih cepat dari np.add.at karena bincount adalah operasi O(n) C-level.
+    Calculate the mean depth_corr per point using np.bincount.
+    Much faster than np.add.at because bincount is an O(n) C-level operation.
  
-    Returns ndarray (n_pt,) — NaN untuk titik tanpa nilai valid.
+    Returns ndarray (n_pt,) — NaN for points without valid values.
     """
     valid = ~np.isnan(depth_corr)
     if not valid.any():
@@ -656,40 +464,46 @@ def _mean_depth_bincount(row_idx, depth_corr, n_pt):
  
  
 # ─────────────────────────────────────────────────────────────────
-# FUNGSI UTAMA
+# Refraction correction for all points observed by multiple cameras:
 # ─────────────────────────────────────────────────────────────────
  
 def process_refraction(r, pc, wl, n_water="default", n_jobs=1, verbose=True):
     """
-    Koreksi kedalaman point cloud terhadap efek refraksi cahaya di air.
- 
-    Untuk setiap titik yang terlihat dari beberapa kamera:
-      1. Hitung kedalaman terkoreksi menggunakan r dari SETIAP kamera
-      2. Rata-ratakan hasil kedalaman terkoreksi dari semua kamera
- 
+    Correct point cloud depths for the effects of light refraction in water.
+
+    For each point observed by multiple cameras:
+    1. Compute the refraction-corrected depth using the inclination angle (r) from EACH camera.
+    2. Average the corrected depths obtained from all observing cameras.
+
     Parameters
     ----------
-    r        : scipy.sparse.csr_matrix (N_pt, N_cam) atau ndarray (N_pt, N_cam)
-               Sudut inklinasi dalam derajat dari visible_points().
-               Sparse: nilai 0 = tidak visible. Dense: NaN = tidak visible.
-    pc       : ndarray (N_pt, ≥3) — kolom: x, y, z, ...
-    wl       : float  — water level saat akuisisi data (meter)
-    n_water  : float atau "default" — refractive index air (default 1.33)
+    r        : scipy.sparse.csr_matrix (N_pt, N_cam) or ndarray (N_pt, N_cam)
+           Inclination angles in degrees returned by visible_points().
+           Sparse: 0 indicates not visible.
+           Dense: NaN indicates not visible.
+    pc       : ndarray (N_pt, ≥3) — columns: x, y, z, ...
+    wl       : float
+           Water level at the time of data acquisition (meters).
+    n_water  : float or "default"
+           Refractive index of water (default: 1.33).
     n_jobs   : int
-               1  = serial (default, terbaik untuk n_vis < 500k)
-               -1 = semua CPU core
-               >1 = jumlah thread eksplisit
-    verbose  : bool — tampilkan ringkasan
- 
+           1  = serial execution (default; best for n_vis < 500k)
+           -1 = use all CPU cores
+           >1 = explicit number of worker threads
+    verbose  : bool
+           Display summary information.
+
     Returns
     -------
     pc_corrected : ndarray (N_pt, ≥3)
-        Point cloud dengan z terkoreksi refraksi.
-        Titik di atas wl tidak diubah.
-        Titik tanpa visible kamera dipertahankan z aslinya.
+    Point cloud with refraction-corrected z values.
+    Points above the water level are left unchanged.
+    Points not visible from any camera retain their original z values.
+
     depth_mean : ndarray (N_pt,)
-        Rata-rata z terkoreksi per titik (dari semua kamera yang melihatnya).
-        NaN jika titik tidak visible dari kamera manapun.
+    Mean refraction-corrected z value for each point,
+    averaged across all cameras that observe the point.
+    NaN if the point is not visible from any camera.
     """
  
     # ── 1. Setup ───────────────────────────────────────────────────
@@ -698,7 +512,7 @@ def process_refraction(r, pc, wl, n_water="default", n_jobs=1, verbose=True):
     n_workers = cpu_count() if n_jobs == -1 else max(1, n_jobs)
  
     if not issparse(r):
-        # Konversi dense → sparse (NaN → 0)
+        # Dense conversion → sparse (NaN → 0)
         from scipy.sparse import csr_matrix as csr
         r_arr = np.asarray(r, dtype=np.float32)
         r_arr[np.isnan(r_arr)] = 0
@@ -713,31 +527,31 @@ def process_refraction(r, pc, wl, n_water="default", n_jobs=1, verbose=True):
         print(f"N_pt={n_pt:,}  N_cam={n_cam}  n_visible={n_vis:,}  "
               f"(dense seria {mem_dense_gb:.1f} GB)")
  
-    # ── 2. Hitung depth terkoreksi per elemen sparse ───────────────
-    # Setiap elemen = satu pasangan (titik, kamera)
-    # row_idx[k] = indeks titik untuk elemen ke-k
+    # ── 2. Compute corrected depth for each sparse element ───────────────
+    # Each element represents a single (point, camera) pair.
+    # row_idx[k] = point index corresponding to the k-th element.
     row_idx = np.repeat(np.arange(n_pt), np.diff(r_csr.indptr))  # (n_vis,)
-    r_data  = r_csr.data.astype(np.float64)                       # (n_vis,) derajat
-    z_elem  = pc[row_idx, 2]                                       # (n_vis,) z tiap titik
+    r_data  = r_csr.data.astype(np.float64)                       # (n_vis,) degree
+    z_elem  = pc[row_idx, 2]                                       # (n_vis,) z each point
  
     if n_workers == 1 or n_vis < 50_000:
-        # ── Serial: satu operasi vectorized untuk semua elemen ────
+        # ── Serial: Each operation vectorized for all elements ────
         depth_per_elem = _refract_depth_per_element(r_data, z_elem, wl, n_water)
         depth_mean = _mean_depth_bincount(row_idx, depth_per_elem, n_pt)
  
     else:
-        # ── Parallel: bagi titik (baris) ke n_workers chunk ────────
-        # Setiap worker menangani subset baris → tidak ada overlap
-        # → bincount lokal aman tanpa lock
+        # ── Parallel: divide points (rows) into n_workers chunks ────────
+        # Each worker processes a subset of rows, so there is no overlap.
+        # Therefore, local bincount operations are safe and do not require locking.
         pt_chunks = np.array_split(np.arange(n_pt), n_workers)
  
         def _worker(pt_idx):
-            """Proses subset baris r_csr[pt_idx, :]."""
+            """Process subset of rows r_csr[pt_idx, :]."""
             sub      = r_csr[pt_idx, :]               # CSR row slicing
             r_sub    = sub.data.astype(np.float64)
             loc_rows = np.repeat(
                 np.arange(len(pt_idx)), np.diff(sub.indptr)
-            )                                          # indeks lokal (0..len-1)
+            )                                          # local indices (0..len-1)
             z_sub    = pc[pt_idx[loc_rows], 2]
             dc       = _refract_depth_per_element(r_sub, z_sub, wl, n_water)
             return _mean_depth_bincount(loc_rows, dc, len(pt_idx))
@@ -746,7 +560,7 @@ def process_refraction(r, pc, wl, n_water="default", n_jobs=1, verbose=True):
             parts = list(executor.map(_worker, pt_chunks))
         depth_mean = np.concatenate(parts)
  
-    # ── 3. Terapkan koreksi ke point cloud ─────────────────────────
+    # ── 3. Apply correction to point cloud ─────────────────────────
     pc_corrected = pc.copy()
  
     below_mask = pc[:, 2] < wl
@@ -755,20 +569,20 @@ def process_refraction(r, pc, wl, n_water="default", n_jobs=1, verbose=True):
     # z_corrected = wl - depth_mean
     pc_corrected[valid_corr, 2] = wl - depth_mean[valid_corr]
  
-    # ── 4. Ringkasan ───────────────────────────────────────────────
+    # ── 4. Summary ───────────────────────────────────────────────
     if verbose:
         n_below   = int(below_mask.sum())
         n_above   = int((~below_mask).sum())
         n_corrected = int(valid_corr.sum())
         n_no_cam  = int((below_mask & np.isnan(depth_mean)).sum())
  
-        print(f"Titik di bawah wl   : {n_below:,} ({100*n_below/n_pt:.2f}%)")
-        print(f"Titik di atas wl    : {n_above:,} ({100*n_above/n_pt:.2f}%)")
-        print(f"Titik terkoreksi    : {n_corrected:,}")
+        print(f"Total points below WL : {n_below:,} ({100*n_below/n_pt:.2f}%)")
+        print(f"Points above WL       : {n_above:,} ({100*n_above/n_pt:.2f}%)")
+        print(f"Corrected points      : {n_corrected:,}")
         if n_no_cam > 0:
-            print(f"Titik tanpa kamera  : {n_no_cam:,} — z tidak dikoreksi")
-        print(f"Point cloud asli    : {n_pt:,} titik")
-        print(f"Point cloud koreksi : {pc_corrected.shape[0]:,} titik")
+            print(f"Points without camera : {n_no_cam:,} — z not corrected")
+        print(f"Original point cloud  : {n_pt:,} points")
+        print(f"Corrected point cloud : {pc_corrected.shape[0]:,} points")
  
     return pc_corrected, depth_mean
 
