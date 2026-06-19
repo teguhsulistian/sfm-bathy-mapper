@@ -362,7 +362,7 @@ def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
     if verbose:
         nnz = r_sparse.nnz
         mem_sparse_mb = (all_vals.nbytes + all_rows.nbytes + all_cols.nbytes) / 1e6
-        print(f"Visible: {nnz:,} / {n_pt * n_cam:,} pasangan "
+        print(f"Visible: {nnz:,} / {n_pt * n_cam:,} pairs "
               f"({100 * nnz / (n_pt * n_cam):.4f}%)")
         print(f"Memory sparse: {mem_sparse_mb:.1f} MB  "
               f"(vs {n_pt * n_cam * 8 / 1e9:.1f} GB dense)")
@@ -425,6 +425,7 @@ def _refract_depth_per_element(r_deg, z_apparent, wl, n_water):
     """
     Calculate the refraction-corrected depth for each (point, camera) pair.
     All operations are vectorized — no Python loops.
+    MEMORY OPTIMIZED: processes only subset of data below water level.
 
     Parameters
     ----------
@@ -439,20 +440,41 @@ def _refract_depth_per_element(r_deg, z_apparent, wl, n_water):
     Refraction-corrected depth (z value).
     Returns NaN if the point is above the water level (wl) or if tan(i) ≈ 0.
     """
-    rad_r = np.deg2rad(r_deg)
- 
+    # Initialize result with NaN (for points above water level)
+    result = np.full_like(r_deg, np.nan, dtype=np.float64)
+    
+    # Early filter: only process points below water level
+    # This is the key optimization: avoid allocating full-size arrays for points above water
+    below_idx = np.where(z_apparent < wl)[0]
+    if len(below_idx) == 0:
+        return result
+    
+    # Extract subset for processing
+    r_below = r_deg[below_idx]
+    z_below = z_apparent[below_idx]
+    
+    # Convert angles and compute refraction (working with subset only)
+    rad_r = np.deg2rad(r_below)
+    sin_r = np.sin(rad_r)
+    tan_r = np.tan(rad_r)
+    
     # Snell's law: sin(i) = sin(r) / n_water
-    sin_i = np.clip((1.0 / n_water) * np.sin(rad_r), -1.0, 1.0)
+    sin_i = np.clip((1.0 / n_water) * sin_r, -1.0, 1.0)
     tan_i = np.tan(np.arcsin(sin_i))
- 
-    # Process points below water level
-    below     = z_apparent < wl
-    depth_app = np.where(below, wl - z_apparent, np.nan)   # apparent depth (positif)
-    xd        = depth_app * np.tan(rad_r)                  # jarak horizontal
- 
-    # True depth
-    safe_tan  = np.where(np.abs(tan_i) > 1e-10, tan_i, np.nan)
-    return xd / safe_tan   # z_corrected = wl - depth_true
+    
+    # Calculate apparent depth (positive) and horizontal distance
+    depth_app = wl - z_below
+    xd = depth_app * tan_r
+    
+    # Apply safe division only where tan_i is not near-zero
+    safe_mask = np.abs(tan_i) > 1e-10
+    result_below = np.full_like(xd, np.nan)
+    result_below[safe_mask] = xd[safe_mask] / tan_i[safe_mask]
+    
+    # Place results back into full array
+    result[below_idx] = result_below
+    
+    return result
  
  
 def _mean_depth_bincount(row_idx, depth_corr, n_pt):
