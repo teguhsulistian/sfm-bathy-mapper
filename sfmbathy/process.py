@@ -13,6 +13,10 @@ from concurrent.futures import ThreadPoolExecutor
 from scipy.sparse import csr_matrix, issparse
 
 
+# ─────────────────────────────────────────────────────────────────
+# Instantaneous field of view (IFOV) Calculation
+# ─────────────────────────────────────────────────────────────────
+
 def _ray_plane_intersect_batch(ray_origins, ray_dirs, plane_z):
     """
     Calculating the intersection of rays with a horizontal plane z = plane_z.
@@ -231,7 +235,7 @@ def _path_to_polygon(mpl_path):
  
  
 # ─────────────────────────────────────────────────────────────────
-# MAIN FUNCTION: Visible points and inclination angle r (sparse output)
+# Visible points and inclination angle r (sparse output)
 # ─────────────────────────────────────────────────────────────────
  
 def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
@@ -409,11 +413,15 @@ def to_dataframe(r_sparse):
     })
 
 
+
 # ─────────────────────────────────────────────────────────────────
-# CORE: Refraction Correction per element (fully vectorized)
+# Refraction correction for all points observed by multiple cameras:
 # ─────────────────────────────────────────────────────────────────
- 
-def _refract_depth_per_element(r_deg, z_apparent, wl, n_water):
+
+
+# Refraction Correction per element (fully vectorized)
+
+ def _refract_depth_per_element(r_deg, z_apparent, wl, n_water):
     """
     Calculate the refraction-corrected depth for each (point, camera) pair.
     All operations are vectorized — no Python loops.
@@ -462,11 +470,7 @@ def _mean_depth_bincount(row_idx, depth_corr, n_pt):
     c[c == 0] = np.nan
     return s / c
  
- 
-# ─────────────────────────────────────────────────────────────────
-# Refraction correction for all points observed by multiple cameras:
-# ─────────────────────────────────────────────────────────────────
- 
+  
 def process_refraction(r, pc, wl, n_water="default", n_jobs=1, verbose=True):
     """
     Correct point cloud depths for the effects of light refraction in water.
@@ -586,7 +590,9 @@ def process_refraction(r, pc, wl, n_water="default", n_jobs=1, verbose=True):
  
     return pc_corrected, depth_mean
 
-
+# ─────────────────────────────────────────────────────────────────
+# Refraction correction for all points observed by small angle approach:
+# ─────────────────────────────────────────────────────────────────
 
 def process_small_angle(pc, WL, n_water):
     """
@@ -621,6 +627,9 @@ def process_small_angle(pc, WL, n_water):
     return pc_corrected
 
 
+# ─────────────────────────────────────────────────────────────────
+# Export corrected point cloud to LAS file:
+# ─────────────────────────────────────────────────────────────────
 def export_pc(pc_corrected, las, output_path):
     """
     Save the corrected point cloud to a new LAS file.
