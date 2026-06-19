@@ -421,7 +421,7 @@ def to_dataframe(r_sparse):
 
 # Refraction Correction per element (fully vectorized)
 
- def _refract_depth_per_element(r_deg, z_apparent, wl, n_water):
+def _refract_depth_per_element(r_deg, z_apparent, wl, n_water):
     """
     Calculate the refraction-corrected depth for each (point, camera) pair.
     All operations are vectorized — no Python loops.
