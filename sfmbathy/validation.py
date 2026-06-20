@@ -596,7 +596,7 @@ def validate_bathymetry(pc_source, validation_file, datum_geotiff, pc_epsg=None,
                                    output_dir / "residuals_vs_depth.png")
     fig3 = plot_error_distribution(val_final, cloud_final,
                                    output_dir / "error_distribution.png")
-
+    
     print("\nSaving results...")
     results_df = pd.DataFrame({
         'validation_x': val_xyz[final_mask, 0],
