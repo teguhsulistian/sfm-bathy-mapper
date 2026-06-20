@@ -413,11 +413,9 @@ def to_dataframe(r_sparse):
     })
 
 
-
 # ─────────────────────────────────────────────────────────────────
 # Refraction correction for all points observed by multiple cameras:
 # ─────────────────────────────────────────────────────────────────
-
 
 # Refraction Correction per element (fully vectorized)
 
