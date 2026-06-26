@@ -238,137 +238,122 @@ def _path_to_polygon(mpl_path):
 # Visible points and inclination angle r (sparse output)
 # ─────────────────────────────────────────────────────────────────
  
-def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=50, verbose=False):
-    """
-    Determine the visibility of point cloud points relative to each camera
-    and compute the inclination angle r. Output in sparse matrix format
-    for maximum memory efficiency.
- 
-    Parameters
-    ----------
-    eo         : pd.DataFrame (N_cam × ≥3) — columns: x, y, z
-    ifov       : pd.DataFrame (N_cam × 1)  — columns: fov (matplotlib Path)
-    pc         : ndarray (N_pt × ≥3)       — columns: x, y, z
-    n_jobs     : int  — number of threads (1=serial, -1=all CPUs)
-    chunk_size : int  — number of cameras per chunk (reduce if RAM is still limited)
-    verbose    : bool — show progress
- 
-    Returns
-    -------
-    r_sparse : scipy.sparse.csr_matrix, shape (N_pt, N_cam), dtype float32
-        Inclination angle in degrees for visible pairs.
-        A value of 0 in the sparse matrix means not visible (not r=0°).
-        Use r_sparse.nnz for the number of visible pairs.
- 
-    How to use the output:
-        # Retrieve all values as dense (only if RAM is sufficient)
-        r_dense = r_sparse.toarray()
-        r_dense[r_dense == 0] = np.nan
- 
-        # Iterate per camera without dense conversion
-        for ci in range(r_sparse.shape[1]):
-            col = r_sparse.getcol(ci)
-            pt_idxs = col.nonzero()[0]      # indices of visible points
-            r_vals  = col.data               # r values for those points
- 
-        # Convert to DataFrame of visible pairs
-        cx, cy = r_sparse.nonzero()
-        r_vals = np.array(r_sparse[cx, cy]).flatten()
-        df = pd.DataFrame({'pt_idx': cx, 'cam_idx': cy, 'r': r_vals})
-    """
+def visible_points(eo, ifov, pc, n_jobs=1, chunk_size=1000, verbose=False,
+                   water_z=None):
     n_cam = eo.shape[0]
     n_pt  = pc.shape[0]
- 
+
+    # ── 0. Pre-filter: sub-water points only ─────────────────────
+    if water_z is not None:
+        sub_mask = pc[:, 2] < water_z
+        sub_idxs = np.where(sub_mask)[0].astype(np.int32)
+        pc_sub   = pc[sub_idxs]
+    else:
+        sub_idxs = np.arange(n_pt, dtype=np.int32)
+        pc_sub   = pc
+
+    n_sub = len(pc_sub)
+
     if verbose:
-        mem_dense_gb = n_pt * n_cam * 8 / 1e9
-        print(f"N_pt={n_pt:,}  N_cam={n_cam:,}  "
-              f"(dense serial {mem_dense_gb:.1f} GB — Using Sparse)")
- 
+        print(f"N_pt={n_pt:,}  N_sub (below water)={n_sub:,}  N_cam={n_cam:,}")
+        print(f"Reduction: {100*(1 - n_sub/n_pt):.1f}% of points skipped")
+
     # ── 1. Convert Path → Polygon ─────────────────────────────────
     polys = [_path_to_polygon(p) for p in ifov['fov']]
- 
-    # ── 2. Build STRtree from all points pc (once) ─────────────
-    pc_xy   = pc[:, :2].astype(np.float64)
-    shp_pts = shp_points(pc_xy)          # vectorized, without Python loop
-    pt_tree = STRtree(shp_pts)
- 
-    # ── 3. Extract camera and pc coordinates as 1D arrays ────────
-    eo_x = eo['x'].to_numpy(np.float64)  # (N_cam,)
+
+    # ── 2. Build STRtree ONCE from filtered points ────────────────
+    if verbose:
+        print("Building STRtree...", end=" ", flush=True)
+
+    pc_sub_xy = pc_sub[:, :2].astype(np.float64)
+    shp_pts   = shp_points(pc_sub_xy)
+    pt_tree   = STRtree(shp_pts)
+
+    if verbose:
+        print("done.")
+
+    # ── 3. Camera and point coordinate arrays ─────────────────────
+    eo_x = eo['x'].to_numpy(np.float64)
     eo_y = eo['y'].to_numpy(np.float64)
     eo_z = eo['z'].to_numpy(np.float64)
-    pc_x = pc[:, 0].astype(np.float64)  # (N_pt,)
-    pc_y = pc[:, 1].astype(np.float64)
-    pc_z = pc[:, 2].astype(np.float64)
- 
-    # ── 4. Accumulate COO data for sparse matrix ──────────────────
-    # COO (Coordinate format): store (row, col, value) only for non-zero entries
+    pc_x = pc_sub[:, 0].astype(np.float64)
+    pc_y = pc_sub[:, 1].astype(np.float64)
+    pc_z = pc_sub[:, 2].astype(np.float64)
+
+    # ── 4. Process cameras in chunks ──────────────────────────────
     rows_list = []
     cols_list = []
     vals_list = []
- 
+
     n_workers = cpu_count() if n_jobs == -1 else max(1, n_jobs)
- 
+
     def _process_cam(ci):
-        """Process a single camera: query visible points, calculate r, return COO."""
         poly = polys[ci]
         if poly is None:
             return None
-        pt_idxs = pt_tree.query(poly, predicate='contains')  # indices of points inside the polygon
-        if len(pt_idxs) == 0:
+        local_idxs = pt_tree.query(poly, predicate='contains')
+        if len(local_idxs) == 0:
             return None
- 
-        # Compute r only for visible points — small array (k,) not (N_pt,)
-        dx = eo_x[ci] - pc_x[pt_idxs]
-        dy = eo_y[ci] - pc_y[pt_idxs]
-        dz = eo_z[ci] - pc_z[pt_idxs]
+        dx = eo_x[ci] - pc_x[local_idxs]
+        dy = eo_y[ci] - pc_y[local_idxs]
+        dz = eo_z[ci] - pc_z[local_idxs]
         d  = np.hypot(dx, dy)
         r  = np.rad2deg(np.arctan2(d, dz)).astype(np.float32)
- 
-        return pt_idxs, r
- 
-    # ── 5. Run per chunk Camera ───────────────────────────────
-    cam_indices = range(n_cam)
- 
-    if n_workers == 1:
-        results = [_process_cam(ci) for ci in cam_indices]
-    else:
-        with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            results = list(ex.map(_process_cam, cam_indices))
- 
-    # ── 6. Accumulate COO data ──────────────────────────────────────
-    for ci, res in enumerate(results):
-        if res is None:
-            continue
-        pt_idxs, r_vals = res
-        rows_list.append(pt_idxs.astype(np.int32))
-        cols_list.append(np.full(len(pt_idxs), ci, dtype=np.int32))
-        vals_list.append(r_vals)
- 
+        orig_idxs = sub_idxs[local_idxs]
+        return orig_idxs, r
+
+    # ── 5. Chunked execution with progress ────────────────────────
+    cam_chunks = [
+        range(i, min(i + chunk_size, n_cam))
+        for i in range(0, n_cam, chunk_size)
+    ]
+
+    processed = 0
+    for chunk in cam_chunks:
+        chunk = list(chunk)
+
+        if n_workers == 1:
+            results = [_process_cam(ci) for ci in chunk]
+        else:
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                results = list(ex.map(_process_cam, chunk))
+
+        for ci, res in zip(chunk, results):
+            if res is None:
+                continue
+            orig_idxs, r_vals = res
+            rows_list.append(orig_idxs)
+            cols_list.append(np.full(len(orig_idxs), ci, dtype=np.int32))
+            vals_list.append(r_vals)
+
+        processed += len(chunk)
+        if verbose:
+            print(f"\r  {processed} / {n_cam} cameras done...", end="", flush=True)
+
+    if verbose:
+        print()  # newline after progress
+
+    # ── 6. Build sparse matrix ─────────────────────────────────────
     if not rows_list:
-        # No visible pairs at all
-        return csr_matrix((n_pt, n_cam), dtype=np.float32)
- 
+        return csr_matrix((n_pt, n_cam), dtype=np.float32), polys
+
     all_rows = np.concatenate(rows_list)
     all_cols = np.concatenate(cols_list)
     all_vals = np.concatenate(vals_list)
- 
-    # ── 7. Build sparse matrix ────────────────────────────────────
+
     r_sparse = csr_matrix(
         (all_vals, (all_rows, all_cols)),
         shape=(n_pt, n_cam),
         dtype=np.float32
     )
- 
+
     if verbose:
         nnz = r_sparse.nnz
-        mem_sparse_mb = (all_vals.nbytes + all_rows.nbytes + all_cols.nbytes) / 1e6
-        print(f"Visible: {nnz:,} / {n_pt * n_cam:,} pairs "
-              f"({100 * nnz / (n_pt * n_cam):.4f}%)")
-        print(f"Memory sparse: {mem_sparse_mb:.1f} MB  "
-              f"(vs {n_pt * n_cam * 8 / 1e9:.1f} GB dense)")
- 
+        mem_mb = (all_vals.nbytes + all_rows.nbytes + all_cols.nbytes) / 1e6
+        print(f"Visible (sub-water): {nnz:,} pairs")
+        print(f"Sparse memory: {mem_mb:.1f} MB")
+
     return r_sparse, polys
- 
  
 # ─────────────────────────────────────────────────────────────────
 # UTILITIES: sparse conversion → dense per camera (stream, RAM efficient)
