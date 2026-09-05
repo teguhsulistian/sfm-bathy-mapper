@@ -14,8 +14,8 @@ svm_depth_prediction.py
 
 Predict bathymetric depth for a Structure-from-Motion (SfM) point cloud
 using a Support Vector Regression (SVR) model calibrated with reference
-depth measurements collected by an Unmanned Surface Vehicle (USV, e.g.
-echo-sounder survey).
+depth measurements collected by an Unmanned Surface Vehicle (e.g.
+echo-sounder survey or bathymetric LiDAR).
 
 Input formats
 -------------
