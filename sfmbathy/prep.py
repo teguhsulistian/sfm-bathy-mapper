@@ -82,4 +82,4 @@ def tide_calc(tide_dir, model, x, y, start_time, end_time, freq):
     print(f"Representative Water Level: {tide_mean:.3f} m , refer to MSL")    
     print(f"Representative Water Level: {WL:.3f} m , refer to Ellipsoid Reference")
 
-    return WL
+    return tide_results, WL
