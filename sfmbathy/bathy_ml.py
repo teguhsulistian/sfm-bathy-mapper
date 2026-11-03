@@ -63,6 +63,9 @@ __all__ = [
     "compute_metrics",
     "plot_validation",
     "predict_dem",
+    "save_model",
+    "load_model",
+    "apply_model",
     "run_bathymetry",
     "compare_models",
 ]
@@ -586,6 +589,129 @@ def predict_dem(
 
 
 # ----------------------------------------------------------------------------
+# 6b. Save / load / re-use a trained model
+# ----------------------------------------------------------------------------
+def _library_versions() -> Dict[str, str]:
+    """Versions of the libraries that matter for unpickling a fitted model."""
+    import sklearn
+
+    v = {"numpy": np.__version__, "pandas": pd.__version__, "scikit-learn": sklearn.__version__}
+    try:
+        import xgboost
+
+        v["xgboost"] = xgboost.__version__
+    except ImportError:
+        pass
+    return v
+
+
+def save_model(path: str, model, model_name: str, metadata: Optional[dict] = None) -> str:
+    """
+    Save a fitted model together with everything needed to re-use it later:
+    feature list, Stumpf constant, training depth range, metrics, image info and
+    library versions. Stored as one joblib file (e.g. 'model_xgb.joblib').
+    """
+    import datetime
+
+    import joblib
+
+    bundle = {
+        "model": model,
+        "model_name": _canonical(model_name),
+        "features": list(FEATURES),
+        "stumpf_n": STUMPF_N,
+        "versions": _library_versions(),
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "meta": metadata or {},
+    }
+    joblib.dump(bundle, path, compress=3)
+    return path
+
+
+def load_model(path: str, check_versions: bool = True) -> dict:
+    """
+    Load a bundle written by save_model().
+
+    Returns a dict with keys: model, model_name, features, stumpf_n, versions, created, meta.
+    Warns when scikit-learn / xgboost versions differ from the ones used for training,
+    because pickled models are only guaranteed to load with the same versions.
+    """
+    import joblib
+
+    bundle = joblib.load(path)
+    if not isinstance(bundle, dict) or "model" not in bundle:  # plain estimator saved by hand
+        bundle = {"model": bundle, "model_name": None, "features": list(FEATURES),
+                  "stumpf_n": STUMPF_N, "versions": {}, "created": None, "meta": {}}
+    if check_versions:
+        now = _library_versions()
+        for lib, ver in bundle.get("versions", {}).items():
+            if lib in now and now[lib] != ver:
+                warnings.warn(
+                    f"{lib} version differs: model trained with {ver}, now {now[lib]}. "
+                    "Results may change or loading may fail; ideally use the same version."
+                )
+    if list(bundle["features"]) != list(FEATURES):
+        raise ValueError("Feature list of the saved model does not match this version of bathy_ml.")
+    return bundle
+
+
+def apply_model(
+    model_path: str,
+    image_tif: str,
+    output_tif: str,
+    min_depth: Optional[float] = None,
+    max_depth: Optional[float] = None,
+    clip_to_training_range: bool = True,
+    output_as_elevation: bool = False,
+    z_offset: float = 0.0,
+    water_mask_tif: Optional[str] = None,
+    n_jobs: int = -1,
+    tile_size: int = 512,
+    verbose: bool = True,
+) -> str:
+    """
+    Apply a saved model to a NEW RGB GeoTIFF (another site or another flight) and write a
+    depth DEM. No training data is needed.
+
+    clip_to_training_range : if True and min/max_depth are not given, predictions are clipped
+        to the depth range seen during training (the model cannot extrapolate beyond it).
+    z_offset : tide / datum correction for the NEW survey (subtracted from predicted depth).
+        It is NOT taken from the training run because the tide at the new site differs.
+    """
+    import rasterio
+
+    bundle = load_model(model_path)
+    meta = bundle["meta"]
+
+    # Compare the new image with the training image and warn about likely problems
+    with rasterio.open(image_tif) as src:
+        new_dtype, new_bands = src.dtypes[0], src.count
+    old = meta.get("image", {})
+    if old.get("dtype") and old["dtype"] != new_dtype:
+        warnings.warn(f"Image data type differs (training {old['dtype']}, new {new_dtype}); "
+                      "pixel scaling is normalised, but check radiometry.")
+    if new_bands < 3:
+        raise ValueError("New image needs at least 3 bands (R, G, B).")
+
+    rng = meta.get("depth_range")
+    if clip_to_training_range and rng:
+        min_depth = rng[0] if min_depth is None else min_depth
+        max_depth = rng[1] if max_depth is None else max_depth
+    if verbose:
+        print(f"Model: {bundle['model_name']} (trained {bundle['created']}), "
+              f"clip range: {min_depth} - {max_depth} m")
+        print("NOTE: RGB-based models transfer best to the same camera, similar water clarity, "
+              "bottom type and lighting. Validate against local depth data when possible.")
+
+    return predict_dem(
+        bundle["model"], image_tif, output_tif,
+        min_depth=min_depth, max_depth=max_depth,
+        output_as_elevation=output_as_elevation, z_offset=z_offset,
+        water_mask_tif=water_mask_tif, n_jobs=n_jobs, tile_size=tile_size, verbose=verbose,
+    )
+
+
+# ----------------------------------------------------------------------------
 # 7. Main function
 # ----------------------------------------------------------------------------
 def run_bathymetry(
@@ -612,6 +738,10 @@ def run_bathymetry(
     cv_folds: int = 5,
     block_size: float = 50.0,
     random_state: int = 42,
+    # --- train / test split (hold-out from the training file) ---
+    test_size: Optional[float] = None,
+    split_method: str = "spatial",
+    refit_full: bool = False,
     # --- parallel processing ---
     n_jobs: int = -1,
     backend_sample: str = "loky",
@@ -646,10 +776,18 @@ def run_bathymetry(
     param_grid: custom grid for tuning (keys as in the estimator; for SVR use
                 'model__regressor__C', etc.). None = built-in grid.
     cv_folds, block_size : spatial cross-validation settings (block_size in map units).
+    test_size : fraction of the training file kept aside as a hold-out test set,
+                e.g. 0.25 -> 75 % training / 25 % testing. None = use all points for
+                training (no hold-out). Tuning and CV only use the training part.
+    split_method : "spatial" = whole blocks (block_size) go to train or test, which avoids
+                the optimistic scores caused by neighbouring points (recommended);
+                "random" = random points (leaky for dense SBES lines).
+    refit_full : after scoring on the hold-out test set, refit the model on ALL training
+                points (train + test) before external validation and DEM export.
     output_as_elevation : DEM stores -depth instead of depth.
     water_mask_tif : optional water mask raster (1 = water) on the same grid.
     plot, plot_path : draw validation figure / save it to a PNG.
-    save_model_path : joblib file to save the fitted model.
+    save_model_path : joblib file for the fitted model + metadata (see load_model / apply_model).
     n_jobs    : parallel workers (-1 = all cores, 1 = serial). Used for point sampling,
                 SVR grid search / CV (RF and XGBoost use the cores inside the model),
                 and block-parallel DEM prediction.
@@ -658,8 +796,9 @@ def run_bathymetry(
 
     Returns
     -------
-    dict with keys: model, model_name, features, train_df, train_metrics, cv_metrics,
-    val_df, val_metrics, dem_path, best_params, figure.
+    dict with keys: model, model_name, features, train_df (has a 'split' column),
+    train_metrics, cv_metrics, test_df, test_metrics, val_df, val_metrics, dem_path,
+    best_params, figure, figure_test.
     """
     name = _canonical(model)
 
@@ -692,6 +831,42 @@ def run_bathymetry(
         + "_"
         + np.floor(train_df["y"] / block_size).astype(int).astype(str)
     ).values
+
+    # ---- optional hold-out split (e.g. test_size=0.25 -> 75 % train / 25 % test) ----
+    train_df["split"] = "train"
+    test_df, test_metrics, fig_test = None, None, None
+    if test_size is not None:
+        if not 0 < test_size < 1:
+            raise ValueError("test_size must be between 0 and 1 (e.g. 0.25).")
+        from sklearn.model_selection import GroupShuffleSplit, train_test_split
+
+        n_blocks = len(np.unique(groups))
+        method = split_method.lower()
+        if method not in ("spatial", "random"):
+            raise ValueError("split_method must be 'spatial' or 'random'.")
+        if method == "spatial" and n_blocks < 4:
+            warnings.warn(
+                f"Only {n_blocks} spatial block(s) at block_size={block_size}; "
+                "using a random split instead. Reduce block_size for a spatial split."
+            )
+            method = "random"
+
+        if method == "spatial":
+            gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+            tr_idx, te_idx = next(gss.split(X, y, groups))
+        else:
+            tr_idx, te_idx = train_test_split(
+                np.arange(len(y)), test_size=test_size, random_state=random_state
+            )
+        train_df.loc[te_idx, "split"] = "test"
+        test_df = train_df.iloc[te_idx].reset_index(drop=True)
+        X_test, y_test = X.iloc[te_idx], y[te_idx]
+        X, y, groups = X.iloc[tr_idx].reset_index(drop=True), y[tr_idx], groups[tr_idx]
+        log(
+            f"    Split ({method}) : train {len(y)} ({100 * len(y) / len(train_df):.0f} %) | "
+            f"test {len(y_test)} ({100 * len(y_test) / len(train_df):.0f} %)"
+        )
+
     n_groups = len(np.unique(groups))
     folds = max(2, min(cv_folds, n_groups))
 
@@ -746,6 +921,33 @@ def run_bathymetry(
     if cv_metrics:
         log(f"    CV         : {_fmt(cv_metrics)}")
 
+    # ---- hold-out test evaluation ----
+    if test_df is not None:
+        test_pred = estimator.predict(X_test)
+        if clip_prediction and (min_depth is not None or max_depth is not None):
+            test_pred = np.clip(test_pred, min_depth, max_depth)
+        test_df["depth_pred"] = test_pred
+        test_df["residual"] = test_pred - y_test
+        test_metrics = compute_metrics(y_test, test_pred)
+        log(f"    Hold-out test : {_fmt(test_metrics)}")
+        if plot or plot_path:
+            test_plot_path = None
+            if plot_path:
+                root, ext = os.path.splitext(plot_path)
+                test_plot_path = f"{root}_test{ext or '.png'}"
+            fig_test = plot_validation(
+                y_test, test_pred, title=f"{name.upper()} - hold-out test",
+                save_path=test_plot_path, show=plot,
+            )
+
+        if refit_full:
+            # Final model uses every training point (train + test) with the chosen settings
+            X_all, y_all = train_df[FEATURES], train_df["depth"].values
+            estimator = get_model(
+                name, {**(model_params or {}), **_strip_prefix(best_params)}, random_state, n_jobs
+            ).fit(X_all, y_all)
+            log("    Refitted final model on all training points (train + test)")
+
     # ---- external validation ----
     val_df, val_metrics, fig = None, None, None
     if val_txt:
@@ -792,9 +994,26 @@ def run_bathymetry(
         log(f"[5] DEM written                : {dem_path}")
 
     if save_model_path:
-        import joblib
+        import rasterio
 
-        joblib.dump(estimator, save_model_path)
+        with rasterio.open(image_tif) as _src:
+            img_info = {"dtype": _src.dtypes[0], "bands": _src.count, "crs": str(_src.crs),
+                        "pixel_size": _src.res}
+        meta = {
+            "depth_range": [float(train_df["depth"].min()), float(train_df["depth"].max())],
+            "n_training_points": int(len(train_df)),
+            "fitted_on": "train+test" if (test_size is not None and refit_full) else
+                         ("train only" if test_size is not None else "all training points"),
+            "best_params": best_params,
+            "model_params": model_params,
+            "settings": {"z_is_depth": z_is_depth, "z_offset": z_offset, "pixel_window": pixel_window,
+                         "thin_cell": thin_cell, "test_size": test_size, "split_method": split_method},
+            "metrics": {"train": train_metrics, "cv": cv_metrics, "test": test_metrics,
+                        "external_validation": val_metrics},
+            "image": img_info,
+            "train_file": os.path.basename(train_txt),
+        }
+        save_model(save_model_path, estimator, name, meta)
         log(f"    Model saved                : {save_model_path}")
 
     return {
@@ -804,11 +1023,14 @@ def run_bathymetry(
         "train_df": train_df,
         "train_metrics": train_metrics,
         "cv_metrics": cv_metrics,
+        "test_df": test_df,
+        "test_metrics": test_metrics,
         "val_df": val_df,
         "val_metrics": val_metrics,
         "dem_path": dem_path,
         "best_params": best_params,
         "figure": fig,
+        "figure_test": fig_test,
     }
 
 
