@@ -161,7 +161,7 @@ def _normalise(arr: np.ndarray, dtype: str) -> np.ndarray:
     return arr  # float imagery is assumed to be already scaled
 
 
-def _sample_chunk(image_tif: str, x: np.ndarray, y: np.ndarray, window: int) -> np.ndarray:
+def _sample_chunk(image_tif: str, x: np.ndarray, y: np.ndarray, window: int, aggregate: str = "mean") -> np.ndarray:
     """
     Sample R, G, B (0-1) for one chunk of points. Opens its own dataset handle so it is
     safe to call from separate threads or processes. Returns an (n, 3) float32 array,
@@ -195,7 +195,8 @@ def _sample_chunk(image_tif: str, x: np.ndarray, y: np.ndarray, window: int) -> 
                 block = _normalise(src.read([1, 2, 3], window=Window(c0, r0, c1 - c0, r1 - r0)), dtype)
                 valid = np.all(block > 0, axis=0)
                 if valid.any():
-                    out[i] = block[:, valid].mean(axis=1)
+                    vals = block[:, valid]
+                    out[i] = np.median(vals, axis=1) if aggregate == "median" else vals.mean(axis=1)
     return out
 
 
@@ -206,6 +207,7 @@ def sample_raster_rgb(
     window: int = 1,
     n_jobs: int = 1,
     backend: str = "loky",
+    aggregate: str = "mean",
 ) -> pd.DataFrame:
     """
     Sample R, G, B (scaled 0-1) at point coordinates.
@@ -213,6 +215,8 @@ def sample_raster_rgb(
     Points must be in the same CRS as the GeoTIFF.
     window = 1 uses the single pixel; window = 3, 5, ... averages a window x window
     neighbourhood (reduces pixel noise).
+    aggregate : "mean" or "median" of the valid pixels in the window (median ignores glint /
+              foam outliers better).
 
     Parallel processing
     -------------------
@@ -231,12 +235,12 @@ def sample_raster_rgb(
     min_points = 5000 if window <= 1 else 200
 
     if workers <= 1 or n < min_points:
-        arr = _sample_chunk(image_tif, x, y, window)
+        arr = _sample_chunk(image_tif, x, y, window, aggregate)
     else:
         # more chunks than workers -> better load balancing
         chunks = [c for c in np.array_split(np.arange(n), workers * 4) if len(c)]
         parts = Parallel(n_jobs=workers, backend=backend)(
-            delayed(_sample_chunk)(image_tif, x[c], y[c], window) for c in chunks
+            delayed(_sample_chunk)(image_tif, x[c], y[c], window, aggregate) for c in chunks
         )
         arr = np.vstack(parts)  # joblib keeps the submission order
 
@@ -485,10 +489,13 @@ def predict_dem(
     n_jobs: int = -1,
     tile_size: int = 512,
     verbose: bool = False,
+    target_resolution: Optional[float] = None,
+    min_valid_fraction: float = 0.5,
+    aggregate: str = "mean",
 ) -> str:
     """
-    Apply a trained model to the entire RGB GeoTIFF tile by tile and write a
-    single-band float32 GeoTIFF (same CRS, extent and resolution as the image).
+    Apply a trained model to the RGB GeoTIFF tile by tile and write a single-band
+    float32 GeoTIFF.
 
     Parameters
     ----------
@@ -496,27 +503,67 @@ def predict_dem(
     output_as_elevation : if True the DEM stores -depth (negative below datum).
     z_offset : value subtracted from the predicted depth before writing.
     water_mask_tif : optional single-band raster (1 = water) on the same grid.
-        Non-water pixels are written as nodata.
-    n_jobs : number of worker threads (joblib convention, -1 = all cores, 1 = serial).
-        Every worker reads its own tile (own raster handle), computes features and
-        predicts; only the main thread writes to the output file, so there is no
-        write contention. Memory stays bounded (a few tiles in flight at a time).
-    tile_size : tile edge in pixels (256-1024 is a good range).
+    n_jobs : worker threads (-1 = all cores, 1 = serial); only the main thread writes.
+    tile_size : tile edge in pixels.
+    target_resolution : output cell size in map units (metres). When given, R, G, B are
+        AVERAGED over blocks of ~target_resolution before the features are computed, and
+        the DEM is written on that coarser grid. This removes pixel-scale noise (texture,
+        glint, ripples, sensor noise) and should match the footprint used for training
+        (see `feature_scale_m` in run_bathymetry). None = predict at the image resolution.
+    min_valid_fraction : a coarse cell needs at least this fraction of valid pixels.
+    aggregate : "mean" or "median" used for the block averaging (must match training).
     """
     import rasterio
+    from affine import Affine
     from rasterio.windows import Window
 
     workers = effective_n_jobs(n_jobs)
     mdl = _single_thread_copy(model) if workers > 1 else model
 
+    with rasterio.open(image_tif) as src:
+        profile = src.profile.copy()
+        height, width = src.height, src.width
+        transform = src.transform
+        pix = abs(src.res[0])
+
+    # aggregation factor k: output cell = k x k input pixels
+    k = max(1, int(round(target_resolution / pix))) if target_resolution else 1
+    if verbose and k > 1:
+        print(f"    DEM grid: {k} x {k} pixel blocks -> cell size {k * pix:.3f} m (input {pix:.3f} m)")
+    tile = max(k, (tile_size // k) * k)  # tiles are multiples of k so blocks never straddle tiles
+    out_h, out_w = -(-height // k), -(-width // k)
+
     def work(win: Window):
-        """Read one tile, build features, predict -> (window, float32 block)."""
+        """Read one tile, (optionally) block-average RGB, build features, predict."""
         with rasterio.open(image_tif) as src:
             rgb = _normalise(src.read([1, 2, 3], window=win), src.dtypes[0])
             valid = np.all(rgb > 0, axis=0) & (src.read_masks(1, window=win) > 0)
         if water_mask_tif:
             with rasterio.open(water_mask_tif) as ms:
                 valid &= ms.read(1, window=win) == 1
+
+        r0, c0 = int(win.row_off), int(win.col_off)
+        if k > 1:
+            h, w = valid.shape
+            ph, pw = (-h) % k, (-w) % k
+            if ph or pw:  # pad edge tiles to a multiple of k
+                rgb = np.pad(rgb, ((0, 0), (0, ph), (0, pw)))
+                valid = np.pad(valid, ((0, ph), (0, pw)))
+            H, W = valid.shape
+            cnt = valid.reshape(H // k, k, W // k, k).sum(axis=(1, 3))
+            if aggregate == "median":
+                # median of the valid pixels in every k x k block (invalid pixels -> NaN)
+                nanrgb = np.where(valid[None], rgb, np.nan)
+                blocks = nanrgb.reshape(3, H // k, k, W // k, k).transpose(0, 1, 3, 2, 4)
+                blocks = blocks.reshape(3, H // k, W // k, k * k)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN blocks are masked below
+                    rgb = np.nanmedian(blocks, axis=-1)
+            else:
+                rgb = np.where(valid[None], rgb, 0.0)
+                rgb = rgb.reshape(3, H // k, k, W // k, k).sum(axis=(2, 4)) / np.maximum(cnt, 1)
+            valid = cnt >= max(1.0, min_valid_fraction * k * k)
+        out_win = Window(c0 // k, r0 // k, valid.shape[1], valid.shape[0])
 
         block = np.full(valid.shape, nodata, dtype="float32")
         if valid.any():
@@ -531,23 +578,21 @@ def predict_dem(
             if output_as_elevation:
                 pred = -pred
             block[valid] = np.where(np.isfinite(pred), pred, nodata).astype("float32")
-        return win, block
+        return out_win, block
 
-    with rasterio.open(image_tif) as src:
-        profile = src.profile.copy()
-        height, width = src.height, src.width
     profile.update(
         driver="GTiff", count=1, dtype="float32", nodata=nodata,
+        width=out_w, height=out_h, transform=transform * Affine.scale(k, k),
         compress="deflate", tiled=True, blockxsize=256, blockysize=256,
     )
     profile.pop("photometric", None)
 
     windows = (
-        Window(c0, r0, min(tile_size, width - c0), min(tile_size, height - r0))
-        for r0 in range(0, height, tile_size)
-        for c0 in range(0, width, tile_size)
+        Window(c0, r0, min(tile, width - c0), min(tile, height - r0))
+        for r0 in range(0, height, tile)
+        for c0 in range(0, width, tile)
     )
-    n_tiles = ((height + tile_size - 1) // tile_size) * ((width + tile_size - 1) // tile_size)
+    n_tiles = ((height + tile - 1) // tile) * ((width + tile - 1) // tile)
     done_count, next_report = 0, 0.1
 
     def report():
@@ -564,7 +609,6 @@ def predict_dem(
                 dst.write(blk, 1, window=w_)
                 report()
         else:
-            # Sliding window of submitted tasks: keeps memory bounded for huge mosaics
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 it = iter(windows)
                 pending = set()
@@ -580,8 +624,8 @@ def predict_dem(
                     finished, _unused = wait(pending, return_when=FIRST_COMPLETED)
                     for fut in finished:
                         pending.discard(fut)
-                        w_, blk = fut.result()  # re-raises any worker exception
-                        dst.write(blk, 1, window=w_)  # single writer (main thread)
+                        w_, blk = fut.result()
+                        dst.write(blk, 1, window=w_)
                         report()
                         submit_next()
 
@@ -668,6 +712,8 @@ def apply_model(
     n_jobs: int = -1,
     tile_size: int = 512,
     verbose: bool = True,
+    target_resolution: Optional[float] = None,
+    aggregate: Optional[str] = None,
 ) -> str:
     """
     Apply a saved model to a NEW RGB GeoTIFF (another site or another flight) and write a
@@ -675,6 +721,7 @@ def apply_model(
 
     clip_to_training_range : if True and min/max_depth are not given, predictions are clipped
         to the depth range seen during training (the model cannot extrapolate beyond it).
+    target_resolution : output cell size (m). None = use the feature_scale_m the model was trained with.
     z_offset : tide / datum correction for the NEW survey (subtracted from predicted depth).
         It is NOT taken from the training run because the tide at the new site differs.
     """
@@ -693,6 +740,10 @@ def apply_model(
     if new_bands < 3:
         raise ValueError("New image needs at least 3 bands (R, G, B).")
 
+    if target_resolution is None:
+        target_resolution = meta.get("settings", {}).get("feature_scale_m")
+    if aggregate is None:  # must match the way the model was trained
+        aggregate = meta.get("settings", {}).get("aggregate", "mean")
     rng = meta.get("depth_range")
     if clip_to_training_range and rng:
         min_depth = rng[0] if min_depth is None else min_depth
@@ -708,6 +759,7 @@ def apply_model(
         min_depth=min_depth, max_depth=max_depth,
         output_as_elevation=output_as_elevation, z_offset=z_offset,
         water_mask_tif=water_mask_tif, n_jobs=n_jobs, tile_size=tile_size, verbose=verbose,
+        target_resolution=target_resolution, aggregate=aggregate,
     )
 
 
@@ -730,6 +782,8 @@ def run_bathymetry(
     min_depth: Optional[float] = 0.0,
     max_depth: Optional[float] = None,
     pixel_window: int = 1,
+    feature_scale_m: Optional[float] = None,
+    aggregate: str = "mean",
     thin_cell: Optional[float] = None,
     # --- modelling ---
     model_params: Optional[dict] = None,
@@ -769,7 +823,14 @@ def run_bathymetry(
     z_is_depth : True if z is depth (positive down); False if z is elevation (negative down).
     z_offset  : tide / datum correction added to depth of training and validation data.
     min_depth, max_depth : depth range used for training, validation and DEM clipping.
-    pixel_window : 1 = single pixel; 3/5 = mean of a window around each point.
+    pixel_window : 1 = single pixel; 3/5 = mean of a window around each point (pixels).
+    feature_scale_m : RECOMMENDED for high-resolution UAV imagery. Spatial scale (metres)
+                at which colour is averaged, e.g. 0.5. Training points use the mean RGB of a
+                window of that footprint (overrides pixel_window) and the DEM is predicted on
+                a grid of that cell size, so training and prediction see the same kind of
+                input and pixel-scale noise is suppressed. None = pixel scale.
+    aggregate : "mean" or "median" used to average the pixels inside the window / DEM cell.
+                Median is more robust to sun glint, foam and shadow pixels.
     thin_cell : cell size (m) to average dense points (e.g. 1.0). None = no thinning.
     model_params : dict overriding default hyper-parameters of the chosen model.
     tune      : True = GridSearchCV with spatial GroupKFold.
@@ -801,6 +862,8 @@ def run_bathymetry(
     best_params, figure, figure_test.
     """
     name = _canonical(model)
+    if aggregate not in ("mean", "median"):
+        raise ValueError("aggregate must be 'mean' or 'median'.")
 
     def log(*a):
         if verbose:
@@ -813,7 +876,17 @@ def run_bathymetry(
         train = _thin_points(train, thin_cell)
         log(f"    After thinning ({thin_cell} m)  : {len(train)}")
 
-    rgb = sample_raster_rgb(image_tif, train["x"].values, train["y"].values, pixel_window, n_jobs, backend_sample)
+    if feature_scale_m:
+        import rasterio
+
+        with rasterio.open(image_tif) as _s:
+            _pix = abs(_s.res[0])
+        pixel_window = max(1, int(round(feature_scale_m / _pix)))
+        if pixel_window % 2 == 0:
+            pixel_window += 1  # centred window needs an odd size
+        log(f"    Feature scale {feature_scale_m} m -> {pixel_window} px window (pixel size {_pix:.3f} m)")
+
+    rgb = sample_raster_rgb(image_tif, train["x"].values, train["y"].values, pixel_window, n_jobs, backend_sample, aggregate)
     feats = build_features(rgb["R"], rgb["G"], rgb["B"])
     train_df = pd.concat([train, feats], axis=1)
     train_df = train_df.dropna(subset=FEATURES + ["depth"]).reset_index(drop=True)
@@ -952,7 +1025,7 @@ def run_bathymetry(
     val_df, val_metrics, fig = None, None, None
     if val_txt:
         val = read_ascii_points(val_txt, val_cols, sep, z_is_depth, z_offset, min_depth, max_depth)
-        vrgb = sample_raster_rgb(image_tif, val["x"].values, val["y"].values, pixel_window, n_jobs, backend_sample)
+        vrgb = sample_raster_rgb(image_tif, val["x"].values, val["y"].values, pixel_window, n_jobs, backend_sample, aggregate)
         vfeat = build_features(vrgb["R"], vrgb["G"], vrgb["B"])
         val_df = pd.concat([val, vfeat], axis=1).dropna(subset=FEATURES + ["depth"]).reset_index(drop=True)
         log(f"[4] External validation points : {len(val_df)} of {len(val)} (inside image, valid pixels)")
@@ -990,6 +1063,8 @@ def run_bathymetry(
             n_jobs=n_jobs,
             tile_size=tile_size,
             verbose=verbose,
+            target_resolution=feature_scale_m,
+            aggregate=aggregate,
         )
         log(f"[5] DEM written                : {dem_path}")
 
@@ -1007,7 +1082,7 @@ def run_bathymetry(
             "best_params": best_params,
             "model_params": model_params,
             "settings": {"z_is_depth": z_is_depth, "z_offset": z_offset, "pixel_window": pixel_window,
-                         "thin_cell": thin_cell, "test_size": test_size, "split_method": split_method},
+                         "thin_cell": thin_cell, "feature_scale_m": feature_scale_m, "aggregate": aggregate, "test_size": test_size, "split_method": split_method},
             "metrics": {"train": train_metrics, "cv": cv_metrics, "test": test_metrics,
                         "external_validation": val_metrics},
             "image": img_info,
