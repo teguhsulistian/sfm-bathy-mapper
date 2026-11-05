@@ -66,9 +66,17 @@ __all__ = [
     "save_model",
     "load_model",
     "apply_model",
+    "save_results",
     "run_bathymetry",
     "compare_models",
 ]
+
+def _ensure_dir(path: Optional[str]) -> None:
+    """Create the parent folder of an output file if it does not exist yet."""
+    folder = os.path.dirname(os.path.abspath(path)) if path else ""
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
 
 # Feature order used for training AND prediction (must never change between the two)
 FEATURES: List[str] = ["R", "G", "B", "lnR", "lnG", "lnB", "ratio_BG", "ratio_BR", "ratio_GR"]
@@ -448,6 +456,7 @@ def plot_validation(
 
     fig.tight_layout()
     if save_path:
+        _ensure_dir(save_path)
         fig.savefig(save_path, dpi=200, bbox_inches="tight")
     if show:
         plt.show()
@@ -610,6 +619,7 @@ def predict_dem(
             print(f"    DEM prediction: {100 * done_count / n_tiles:.0f}% ({done_count}/{n_tiles} tiles)")
             next_report += 0.1
 
+    _ensure_dir(output_tif)
     with rasterio.open(output_tif, "w", **profile) as dst:
         if workers <= 1:
             for win in windows:
@@ -676,6 +686,7 @@ def save_model(path: str, model, model_name: str, metadata: Optional[dict] = Non
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
         "meta": metadata or {},
     }
+    _ensure_dir(path)
     joblib.dump(bundle, path, compress=3)
     return path
 
@@ -772,6 +783,81 @@ def apply_model(
 
 
 # ----------------------------------------------------------------------------
+# 6c. Save statistics / validation tables
+# ----------------------------------------------------------------------------
+def _metrics_table(res: dict) -> pd.DataFrame:
+    """One row per evaluation set: Training, Spatial CV, Hold-out test, External validation."""
+    rows = []
+    for label, key in [
+        ("Training", "train_metrics"),
+        ("Spatial CV", "cv_metrics"),
+        ("Hold-out test", "test_metrics"),
+        ("External validation", "val_metrics"),
+    ]:
+        m = res.get(key)
+        if m:
+            rows.append({"model": res.get("model_name"), "dataset": label, **m})
+    return pd.DataFrame(rows)
+
+
+def save_results(res: dict, prefix: str, excel: bool = True, decimals: int = 4) -> Dict[str, str]:
+    """
+    Save the statistics of a run_bathymetry() result to disk.
+
+    Files written (prefix = e.g. "out/rf_siteA"):
+        <prefix>_metrics.csv            RMSE, MAE, R2, Bias, N for every evaluation set
+        <prefix>_settings.json          all settings + metrics + library versions (reproducibility)
+        <prefix>_validation_points.csv  x, y, observed, predicted, residual (external validation)
+        <prefix>_test_points.csv        same for the hold-out test set (if test_size was used)
+        <prefix>_results.xlsx           everything above as sheets (if excel=True and openpyxl is installed)
+
+    The validation plots are saved separately through run_bathymetry(plot_path=...).
+    Returns a dict {name: file path}.
+    """
+    import json
+
+    folder = os.path.dirname(prefix)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
+    files: Dict[str, str] = {}
+    metrics = _metrics_table(res).round(decimals)
+    files["metrics"] = f"{prefix}_metrics.csv"
+    metrics.to_csv(files["metrics"], index=False)
+
+    settings = dict(res.get("settings", {}))
+    settings["metrics"] = {k: res.get(k) for k in ("train_metrics", "cv_metrics", "test_metrics", "val_metrics")}
+    files["settings"] = f"{prefix}_settings.json"
+    with open(files["settings"], "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=2, default=str)
+
+    points = {}
+    for key, label in (("val_df", "validation_points"), ("test_df", "test_points")):
+        df = res.get(key)
+        if df is not None and len(df):
+            cols = [c for c in ("x", "y", "depth", "depth_pred", "residual") if c in df.columns]
+            points[label] = df[cols].rename(columns={"depth": "depth_observed", "depth_pred": "depth_predicted"}).round(decimals)
+            files[label] = f"{prefix}_{label}.csv"
+            points[label].to_csv(files[label], index=False)
+
+    if excel:
+        try:
+            xlsx = f"{prefix}_results.xlsx"
+            with pd.ExcelWriter(xlsx) as xw:
+                metrics.to_excel(xw, sheet_name="metrics", index=False)
+                flat = {k: v for k, v in settings.items() if k != "metrics"}
+                pd.DataFrame({"setting": list(flat), "value": [str(v) for v in flat.values()]}).to_excel(
+                    xw, sheet_name="settings", index=False
+                )
+                for label, df in points.items():
+                    df.head(1_000_000).to_excel(xw, sheet_name=label, index=False)
+            files["excel"] = xlsx
+        except ImportError:
+            warnings.warn("Excel export skipped: install openpyxl (pip install openpyxl).")
+    return files
+
+
+# ----------------------------------------------------------------------------
 # 7. Main function
 # ----------------------------------------------------------------------------
 def run_bathymetry(
@@ -815,6 +901,7 @@ def run_bathymetry(
     plot: bool = True,
     plot_path: Optional[str] = None,
     save_model_path: Optional[str] = None,
+    stats_prefix: Optional[str] = None,
     verbose: bool = True,
 ) -> dict:
     """
@@ -857,6 +944,8 @@ def run_bathymetry(
     water_mask_tif : optional water mask raster (1 = water) on the same grid.
     plot, plot_path : draw validation figure / save it to a PNG.
     save_model_path : joblib file for the fitted model + metadata (see load_model / apply_model).
+    stats_prefix : if given (e.g. "out/rf_siteA"), statistics are saved to CSV / JSON / Excel
+                with save_results(); the validation plots use plot_path.
     n_jobs    : parallel workers (-1 = all cores, 1 = serial). Used for point sampling,
                 SVR grid search / CV (RF and XGBoost use the cores inside the model),
                 and block-parallel DEM prediction.
@@ -1099,10 +1188,39 @@ def run_bathymetry(
         save_model(save_model_path, estimator, name, meta)
         log(f"    Model saved                : {save_model_path}")
 
-    return {
+    import datetime
+
+    settings = {
+        "model": name,
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "train_file": train_txt,
+        "image": image_tif,
+        "validation_file": val_txt,
+        "dem": dem_path,
+        "n_training_points": int(len(train_df)),
+        "depth_range_training": [float(train_df["depth"].min()), float(train_df["depth"].max())],
+        "feature_scale_m": feature_scale_m,
+        "aggregate": aggregate,
+        "pixel_window": pixel_window,
+        "thin_cell": thin_cell,
+        "test_size": test_size,
+        "split_method": split_method if test_size is not None else None,
+        "refit_full": refit_full,
+        "tuned": tune,
+        "best_params": best_params,
+        "model_params": model_params,
+        "z_is_depth": z_is_depth,
+        "z_offset": z_offset,
+        "min_depth": min_depth,
+        "max_depth": max_depth,
+        "versions": _library_versions(),
+    }
+
+    result = {
         "model": estimator,
         "model_name": name,
         "features": FEATURES,
+        "settings": settings,
         "train_df": train_df,
         "train_metrics": train_metrics,
         "cv_metrics": cv_metrics,
@@ -1115,6 +1233,10 @@ def run_bathymetry(
         "figure": fig,
         "figure_test": fig_test,
     }
+    if stats_prefix:
+        result["stats_files"] = save_results(result, stats_prefix)
+        log("    Statistics saved           : " + ", ".join(result["stats_files"].values()))
+    return result
 
 
 def _compare_one(train_txt, image_tif, val_txt, m, output_prefix, kwargs) -> dict:
@@ -1135,6 +1257,7 @@ def compare_models(
     output_prefix: Optional[str] = None,
     parallel_models: bool = False,
     n_jobs: int = -1,
+    save_path: Optional[str] = None,
     **kwargs,
 ) -> pd.DataFrame:
     """
@@ -1147,6 +1270,7 @@ def compare_models(
                       split the cores between them (no interactive plots, quiet log).
                       False = run one after another, each using all cores.
     n_jobs          : total cores available.
+    save_path       : save the comparison table (".csv" or ".xlsx").
     **kwargs        : any other argument of run_bathymetry().
     """
     models = list(models)
@@ -1164,7 +1288,16 @@ def compare_models(
             _compare_one(train_txt, image_tif, val_txt, m, output_prefix, {**kwargs, "n_jobs": n_jobs})
             for m in models
         ]
-    return pd.DataFrame(rows).set_index("model")
+    table = pd.DataFrame(rows).set_index("model")
+    if save_path:
+        folder = os.path.dirname(save_path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        if save_path.lower().endswith((".xlsx", ".xls")):
+            table.round(4).to_excel(save_path)
+        else:
+            table.round(4).to_csv(save_path)
+    return table
 
 
 # ----------------------------------------------------------------------------
