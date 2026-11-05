@@ -555,10 +555,15 @@ def predict_dem(
                 # median of the valid pixels in every k x k block (invalid pixels -> NaN)
                 nanrgb = np.where(valid[None], rgb, np.nan)
                 blocks = nanrgb.reshape(3, H // k, k, W // k, k).transpose(0, 1, 3, 2, 4)
-                blocks = blocks.reshape(3, H // k, W // k, k * k)
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN blocks are masked below
-                    rgb = np.nanmedian(blocks, axis=-1)
+                blocks = blocks.reshape(3, -1, k * k)
+                # Median only for blocks with >= 1 valid pixel: no all-NaN slices, so no
+                # RuntimeWarning (warnings.catch_warnings is not thread-safe, so it cannot
+                # be used reliably inside the worker threads).
+                has = (cnt > 0).ravel()
+                med = np.zeros((3, blocks.shape[1]), dtype="float32")
+                if has.any():
+                    med[:, has] = np.nanmedian(blocks[:, has], axis=-1)
+                rgb = med.reshape(3, H // k, W // k)
             else:
                 rgb = np.where(valid[None], rgb, 0.0)
                 rgb = rgb.reshape(3, H // k, k, W // k, k).sum(axis=(2, 4)) / np.maximum(cnt, 1)
@@ -582,7 +587,10 @@ def predict_dem(
 
     profile.update(
         driver="GTiff", count=1, dtype="float32", nodata=nodata,
-        width=out_w, height=out_h, transform=transform * Affine.scale(k, k),
+        width=out_w, height=out_h,
+        # same as transform * Affine.scale(k, k) but without the deprecated '*' operator
+        transform=Affine(transform.a * k, transform.b * k, transform.c,
+                         transform.d * k, transform.e * k, transform.f),
         compress="deflate", tiled=True, blockxsize=256, blockysize=256,
     )
     profile.pop("photometric", None)
