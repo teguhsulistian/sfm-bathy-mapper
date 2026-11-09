@@ -718,40 +718,78 @@ def load_model(path: str, check_versions: bool = True) -> dict:
     return bundle
 
 
+# Uses: load_model, read_ascii_points, sample_raster_rgb, build_features, compute_metrics,
+# plot_validation, predict_dem, save_results, _fmt, _library_versions.
+# ---------------------------------------------------------------------------
 def apply_model(
     model_path: str,
     image_tif: str,
-    output_tif: str,
+    output_tif: Optional[str] = None,
+    # --- external check at the new location (optional) ---
+    val_txt: Optional[str] = None,
+    val_cols: ColSpec = (0, 1, 2),
+    sep: Optional[str] = None,
+    z_is_depth: Optional[bool] = None,
+    z_offset: float = 0.0,
+    val_min_depth: Optional[float] = 0.0,
+    val_max_depth: Optional[float] = None,
+    # --- prediction settings ---
     min_depth: Optional[float] = None,
     max_depth: Optional[float] = None,
     clip_to_training_range: bool = True,
-    output_as_elevation: bool = False,
-    z_offset: float = 0.0,
+    output_as_elevation: Optional[bool] = None,
     water_mask_tif: Optional[str] = None,
     n_jobs: int = -1,
     tile_size: int = 512,
-    verbose: bool = True,
     target_resolution: Optional[float] = None,
     aggregate: Optional[str] = None,
-) -> str:
+    # --- outputs ---
+    plot: bool = True,
+    plot_path: Optional[str] = None,
+    stats_prefix: Optional[str] = None,
+    verbose: bool = True,
+) -> dict:
     """
-    Apply a saved model to a NEW RGB GeoTIFF (another site or another flight) and write a
-    depth DEM. No training data is needed.
+    Apply a saved model to a NEW RGB GeoTIFF (another site / flight) WITHOUT training data,
+    and optionally check it against independent reference points (e.g. USV SBES) there.
 
-    clip_to_training_range : if True and min/max_depth are not given, predictions are clipped
-        to the depth range seen during training (the model cannot extrapolate beyond it).
-    target_resolution : output cell size (m). None = use the feature_scale_m the model was trained with.
-    z_offset : tide / datum correction for the NEW survey (subtracted from predicted depth).
-        It is NOT taken from the training run because the tide at the new site differs.
+    Parameters
+    ----------
+    model_path : joblib file written by run_bathymetry(save_model_path=...).
+    image_tif  : new RGB GeoTIFF.
+    output_tif : DEM to write. None = only run the external check.
+    val_txt    : ASCII x, y, z file at the new location (same CRS as image_tif). Used ONLY
+                 for checking, never for training or calibration.
+    val_cols, sep : columns / delimiter of val_txt.
+    z_is_depth : sign convention of val_txt z. None = same as the training run (from the model).
+                 False = z is elevation (negative below datum), True = z is depth (positive).
+    z_offset   : tide / datum correction of the NEW survey, added to the depth of val_txt and
+                 subtracted from the DEM (same meaning as in run_bathymetry). It is NOT taken
+                 from the training run, because the water level differs between surveys.
+    val_min_depth, val_max_depth : keep only check points inside this depth range
+                 (default 0.0 drops land / positive elevations).
+    min_depth, max_depth : clip predictions (model depth, positive). None + clip_to_training_range
+                 = the depth range seen in training.
+    output_as_elevation : None = automatic: the DEM follows the convention of the input data
+                 (z_is_depth False -> elevation, negative below datum; True -> positive depth).
+                 True / False = force the sign of the DEM.
+    target_resolution, aggregate : None = use feature_scale_m / aggregate of the training run.
+
+    Returns a dict: dem_path, val_df, val_metrics, suggested_z_offset, settings, figure, stats_files.
     """
     import rasterio
 
     bundle = load_model(model_path)
     meta = bundle["meta"]
+    model = bundle["model"]
+    saved = meta.get("settings", {})
+    if z_is_depth is None:
+        z_is_depth = saved.get("z_is_depth", True)
+    if output_as_elevation is None:
+        output_as_elevation = not z_is_depth
 
-    # Compare the new image with the training image and warn about likely problems
     with rasterio.open(image_tif) as src:
-        new_dtype, new_bands = src.dtypes[0], src.count
+        new_dtype, new_bands, pix = src.dtypes[0], src.count, abs(src.res[0])
     old = meta.get("image", {})
     if old.get("dtype") and old["dtype"] != new_dtype:
         warnings.warn(f"Image data type differs (training {old['dtype']}, new {new_dtype}); "
@@ -759,27 +797,98 @@ def apply_model(
     if new_bands < 3:
         raise ValueError("New image needs at least 3 bands (R, G, B).")
 
+    # Feature scale and aggregation must be the same as in training
+    trained_scale = saved.get("feature_scale_m")
     if target_resolution is None:
-        target_resolution = meta.get("settings", {}).get("feature_scale_m")
-    if aggregate is None:  # must match the way the model was trained
-        aggregate = meta.get("settings", {}).get("aggregate", "mean")
+        target_resolution = trained_scale
+    elif trained_scale and abs(target_resolution - trained_scale) > 1e-9:
+        warnings.warn(f"target_resolution ({target_resolution}) differs from the feature scale used in "
+                      f"training ({trained_scale}); predictions may be less reliable.")
+    if aggregate is None:
+        aggregate = saved.get("aggregate", "mean")
+    if aggregate not in ("mean", "median"):
+        raise ValueError("aggregate must be 'mean' or 'median'.")
+
+    # Clip range (model depth, positive)
     rng = meta.get("depth_range")
     if clip_to_training_range and rng:
         min_depth = rng[0] if min_depth is None else min_depth
         max_depth = rng[1] if max_depth is None else max_depth
+
     if verbose:
         print(f"Model: {bundle['model_name']} (trained {bundle['created']}), "
               f"clip range: {min_depth} - {max_depth} m")
+        print(f"       feature scale: {target_resolution} m, aggregate: {aggregate}, "
+              f"z_is_depth: {z_is_depth}, z_offset: {z_offset}")
         print("NOTE: RGB-based models transfer best to the same camera, similar water clarity, "
-              "bottom type and lighting. Validate against local depth data when possible.")
+              "bottom type and lighting. A different water level shifts the result: set z_offset.")
 
-    return predict_dem(
-        bundle["model"], image_tif, output_tif,
-        min_depth=min_depth, max_depth=max_depth,
-        output_as_elevation=output_as_elevation, z_offset=z_offset,
-        water_mask_tif=water_mask_tif, n_jobs=n_jobs, tile_size=tile_size, verbose=verbose,
-        target_resolution=target_resolution, aggregate=aggregate,
-    )
+    result = {"dem_path": None, "val_df": None, "val_metrics": None,
+              "suggested_z_offset": None, "figure": None, "stats_files": None}
+
+    # ---------------- external check at the new location ----------------
+    if val_txt:
+        val = read_ascii_points(val_txt, val_cols, sep, z_is_depth, z_offset, val_min_depth, val_max_depth)
+        if target_resolution:
+            win = max(1, int(round(target_resolution / pix)))
+            win += 1 - win % 2                       # centred window needs an odd size
+        else:
+            win = int(saved.get("pixel_window") or 1)
+        rgb = sample_raster_rgb(image_tif, val["x"].values, val["y"].values, win, n_jobs, "loky", aggregate)
+        feats = build_features(rgb["R"], rgb["G"], rgb["B"])
+        val_df = pd.concat([val, feats], axis=1).dropna(subset=FEATURES + ["depth"]).reset_index(drop=True)
+        if verbose:
+            print(f"External check: {len(val_df)} of {len(val)} points inside the image with valid pixels")
+        if len(val_df) < 3:
+            warnings.warn("Fewer than 3 valid check points; statistics skipped. "
+                          "Are the points in the same CRS and inside the image?")
+        else:
+            pred = model.predict(val_df[FEATURES])
+            if min_depth is not None or max_depth is not None:
+                pred = np.clip(pred, min_depth, max_depth)
+            val_df["depth_pred"] = pred
+            val_df["residual"] = pred - val_df["depth"]
+            m = compute_metrics(val_df["depth"], pred)
+            # mean(pred - depth_file) = Bias + z_offset  ->  the offset that would remove the bias
+            result.update(val_df=val_df, val_metrics=m, suggested_z_offset=z_offset + m["Bias"])
+            if verbose:
+                print(f"    Result: {_fmt(m)}")
+                print(f"    Mean bias {m['Bias']:+.3f} m. z_offset = {z_offset + m['Bias']:+.3f} would remove it, "
+                      "but that calibrates on these points, so they would no longer be an independent check.")
+            if plot or plot_path:
+                result["figure"] = plot_validation(
+                    val_df["depth"], pred,
+                    title=f"{bundle['model_name'].upper()} - external check (new location)",
+                    save_path=plot_path, show=plot)
+
+    # ---------------- DEM ----------------
+    if output_tif:
+        result["dem_path"] = predict_dem(
+            model, image_tif, output_tif,
+            min_depth=min_depth, max_depth=max_depth,
+            output_as_elevation=output_as_elevation, z_offset=z_offset,
+            water_mask_tif=water_mask_tif, n_jobs=n_jobs, tile_size=tile_size, verbose=verbose,
+            target_resolution=target_resolution, aggregate=aggregate,
+        )
+        if verbose:
+            print(f"DEM written: {output_tif}")
+
+    result["settings"] = {
+        "model": bundle["model_name"], "model_file": model_path, "image": image_tif,
+        "validation_file": val_txt, "dem": result["dem_path"],
+        "feature_scale_m": target_resolution, "aggregate": aggregate,
+        "z_is_depth": z_is_depth, "z_offset": z_offset, "output_as_elevation": output_as_elevation,
+        "clip_range": [min_depth, max_depth], "suggested_z_offset": result["suggested_z_offset"],
+        "versions": _library_versions(),
+    }
+    if stats_prefix:
+        result["stats_files"] = save_results(
+            {"model_name": bundle["model_name"], "settings": result["settings"],
+             "val_metrics": result["val_metrics"], "val_df": result["val_df"]}, stats_prefix)
+        if verbose:
+            print("Statistics saved: " + ", ".join(result["stats_files"].values()))
+    return result
+
 
 
 # ----------------------------------------------------------------------------
