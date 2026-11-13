@@ -8,16 +8,21 @@ requires-python = ">=3.11"
 dependencies = [
     "pandas>=2.0",
     "rasterio>=1.4.3",
+    "dask",
     "eo-tides",
     "geopandas",
     "ipykernel",
+    "joblib",
     "laspy",
     "xarray",
     "rioxarray",
     "pyproj",
     "numpy",
+    "openpyxl",
     "scipy",
     "matplotlib",
+    "xgboost",
+    "scikit-learn",
     "pyTMD @ git+https://github.com/teguhsulistian/pyTMD.git@inatides-v2",
 ]
 
